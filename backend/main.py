@@ -462,7 +462,7 @@ async def import_participants_csv(
             if len(name) > 255 or len(email) > 320 or (phone and len(phone) > 50):
                 skipped_count += 1
                 continue
-            if not re.fullmatch(r"[^\\s@]+@[^\\s@]+\\.[^\\s@]+", email):
+            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
                 skipped_count += 1
                 continue
 
@@ -728,6 +728,45 @@ async def send_event_passes(
     }
 
     
+
+@app.post("/events/{event_id}/verify-pass")
+def verify_participant_pass(
+    event_id: str,
+    payload: CheckInRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Validate a pass and return minimal participant details without checking them in."""
+    require_event_access(event_id, current_user, db)
+
+    token = payload.qr_token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="QR pass token cannot be empty")
+
+    participant = db.query(models.Participant).filter(
+        models.Participant.event_id == event_id,
+        models.Participant.qr_token == token,
+    ).first()
+    if participant is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Invalid QR pass token. Participant not found for this event.",
+        )
+
+    return {
+        "status": "verified",
+        "participant": {
+            "id": participant.id,
+            "name": participant.name,
+            "email": participant.email,
+            "checked_in": bool(participant.checked_in),
+            "checked_in_at": (
+                participant.checked_in_at.isoformat()
+                if participant.checked_in_at else None
+            ),
+        },
+    }
+
 
 @app.post("/events/{event_id}/check-in")
 def check_in_participant(

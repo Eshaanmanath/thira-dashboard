@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Calendar, 
   Users, 
@@ -288,33 +288,70 @@ export default function Dashboard() {
     }
   };
 
-  // Modal State for Gate Check-in Scanner
+  // QR scanner: scan/verify first, then explicitly confirm check-in.
   const [showCheckInModal, setShowCheckInModal] = useState(false);
   const [checkInToken, setCheckInToken] = useState('');
+  const [checkInPreview, setCheckInPreview] = useState(null);
   const [checkInResult, setCheckInResult] = useState(null);
   const [checkingIn, setCheckingIn] = useState(false);
+  const [verifyingPass, setVerifyingPass] = useState(false);
+  const [scannerCycle, setScannerCycle] = useState(0);
+  const scannerLockRef = useRef(false);
+
+  const verifyPass = async (rawToken) => {
+    const token = (rawToken || '').trim();
+    if (!selectedEvent || !token || verifyingPass || checkingIn) return;
+
+    setVerifyingPass(true);
+    setCheckInResult(null);
+    setCheckInPreview(null);
+    setCheckInToken(token);
+    try {
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/verify-pass`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qr_token: token }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not verify this pass');
+      setCheckInPreview(data.participant);
+      if (data.participant.checked_in) {
+        setCheckInResult({
+          status: 'already_checked_in',
+          message: 'This participant has already checked in.',
+          participant: data.participant,
+        });
+      }
+    } catch (err) {
+      setCheckInResult({ status: 'error', message: err.message });
+    } finally {
+      setVerifyingPass(false);
+    }
+  };
 
   const handleCheckIn = async (e) => {
-    e.preventDefault();
-    if (!selectedEvent || !checkInToken) return;
+    if (e) e.preventDefault();
+    if (!selectedEvent || !checkInPreview || checkInPreview.checked_in || checkingIn) return;
 
     try {
       setCheckingIn(true);
       setCheckInResult(null);
-
       const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ qr_token: checkInToken })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qr_token: checkInToken.trim() }),
       });
-
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Check-in failed");
+      if (!res.ok) throw new Error(data.detail || 'Check-in failed');
 
       setCheckInResult(data);
       setCheckInToken('');
+      setCheckInPreview(null);
+      // After a confirmed successful check-in, restart the camera immediately for the next person.
+      if (data.status === 'success') {
+        scannerLockRef.current = false;
+        setScannerCycle((cycle) => cycle + 1);
+      }
     } catch (err) {
       setCheckInResult({ status: 'error', message: err.message });
     } finally {
@@ -323,49 +360,59 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-  let scanner = null;
-  if (showCheckInModal && selectedEvent) {
-    // Slight timeout to ensure the DOM element #reader is rendered
+    let scanner = null;
+    let cancelled = false;
+    if (!showCheckInModal || !selectedEvent || checkInPreview || verifyingPass || checkingIn) {
+      return undefined;
+    }
+
+    scannerLockRef.current = false;
     const timer = setTimeout(() => {
-      scanner = new Html5QrcodeScanner("reader", { 
-        fps: 10, 
-        qrbox: { width: 250, height: 250 } 
+      if (cancelled) return;
+      const readerId = `reader-${scannerCycle}`;
+      const reader = document.getElementById(readerId);
+      if (!reader) return;
+
+      scanner = new Html5QrcodeScanner(readerId, {
+        fps: 12,
+        qrbox: { width: 250, height: 250 },
+        rememberLastUsedCamera: true,
       }, false);
 
       scanner.render(
         async (decodedText) => {
-          // Success callback when QR is scanned by camera
-          setCheckInToken(decodedText);
-          // Automatically trigger check-in API with scanned token
+          // Lock immediately: the same QR can be decoded across several frames.
+          if (scannerLockRef.current) return;
+          scannerLockRef.current = true;
           try {
-            const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
-              method: 'POST',
-              headers: { 
-                'Content-Type': 'application/json',
-                    },
-              body: JSON.stringify({ qr_token: decodedText.trim() })
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || "Check-in failed");
-            setCheckInResult(data);
+            await scanner?.clear();
           } catch (err) {
-            setCheckInResult({ status: 'error', message: err.message });
+            console.debug('Scanner pause:', err);
           }
+          await verifyPass(decodedText);
         },
-        (error) => {
-          // Scanning frame error (ignored to prevent console spam while searching for code)
+        () => {
+          // No QR in the current frame is expected while waiting for a pass.
         }
       );
     }, 100);
 
     return () => {
+      cancelled = true;
       clearTimeout(timer);
       if (scanner) {
-        scanner.clear().catch((e) => console.error("Failed to clear scanner", e));
+        scanner.clear().catch((err) => console.debug('Scanner cleanup:', err));
       }
     };
-  }
-}, [showCheckInModal, selectedEvent]);
+  }, [showCheckInModal, selectedEvent, scannerCycle, checkInPreview, verifyingPass, checkingIn]);
+
+  const resetCheckInScanner = () => {
+    setCheckInToken('');
+    setCheckInPreview(null);
+    setCheckInResult(null);
+    scannerLockRef.current = false;
+    setScannerCycle((cycle) => cycle + 1);
+  };
 
   if (authChecking) {
     return <div className="flex min-h-screen items-center justify-center bg-slate-900 text-slate-200"><Loader2 className="mr-3 h-5 w-5 animate-spin text-indigo-400" /> Checking session...</div>;
@@ -723,7 +770,7 @@ export default function Dashboard() {
                   </p>
                 </div>
                 <button 
-                  onClick={() => { setShowCheckInModal(true); setCheckInResult(null); }}
+                  onClick={() => { resetCheckInScanner(); setShowCheckInModal(true); }}
                   className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white rounded-lg transition-colors shadow-md"
                 >
                   Open QR Scanner
@@ -871,71 +918,99 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* MODAL: GATE CHECK-IN SCANNER WITH CAMERA */}
+      {/* MODAL: GATE CHECK-IN SCANNER WITH EXPLICIT CONFIRMATION */}
       {showCheckInModal && selectedEvent && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-slate-950 border border-slate-800 w-full max-w-lg rounded-2xl p-6">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-lg font-bold text-white">Live Gate Check-in Scanner</h3>
+              <h3 className="text-lg font-bold text-white">Live Gate Check-in</h3>
               <span className="text-xs bg-emerald-950 text-emerald-300 border border-emerald-800 px-2.5 py-1 rounded-full font-medium">
-                Role: {currentRole}
+                {currentRole}
               </span>
             </div>
             <p className="text-xs text-slate-400 mb-4">
-              Point your camera at the participant's QR pass or paste the token code manually.
+              Scan or enter a pass to verify the participant. Check-in happens only after you confirm.
             </p>
 
-            {/* CAMERA VIEWFINDER CONTAINER */}
-            <div className="mb-4 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden p-2">
-              <div id="reader" className="w-full"></div>
-            </div>
+            {!checkInPreview && (
+              <>
+                <div className="mb-4 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden p-2">
+                  <div id={`reader-${scannerCycle}`} className="w-full" />
+                  {(verifyingPass || checkingIn) && (
+                    <div className="flex items-center justify-center gap-2 py-3 text-xs text-slate-300">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {verifyingPass ? 'Verifying pass…' : 'Checking in participant…'}
+                    </div>
+                  )}
+                </div>
 
-            {/* MANUAL FALLBACK INPUT */}
-            <form onSubmit={handleCheckIn} className="space-y-3 mb-4">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Or type/paste token (e.g. THIRA-8F4A2C11)"
-                  value={checkInToken}
-                  onChange={(e) => setCheckInToken(e.target.value)}
-                  className="flex-1 bg-slate-900 border border-slate-700 text-white font-mono rounded-lg p-2.5 text-xs focus:outline-none focus:border-emerald-500 uppercase"
-                />
-                <button
-                  type="submit"
-                  disabled={checkingIn}
-                  className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white rounded-lg transition-all disabled:opacity-50 shadow-md"
-                >
-                  {checkingIn ? 'Verifying...' : 'Verify'}
-                </button>
+                <form onSubmit={(e) => { e.preventDefault(); verifyPass(checkInToken); }} className="space-y-3 mb-4">
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="Or type/paste pass token"
+                      value={checkInToken}
+                      onChange={(e) => setCheckInToken(e.target.value)}
+                      className="flex-1 bg-slate-900 border border-slate-700 text-white font-mono rounded-lg p-2.5 text-xs focus:outline-none focus:border-emerald-500"
+                    />
+                    <button type="submit" disabled={verifyingPass || checkingIn || !checkInToken.trim()} className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white rounded-lg disabled:opacity-50">
+                      {verifyingPass ? 'Verifying…' : 'Verify Pass'}
+                    </button>
+                  </div>
+                </form>
+              </>
+            )}
+
+            {checkInPreview && (
+              <div className="rounded-xl border border-slate-700 bg-slate-900 p-4 mb-4">
+                <div className="flex items-start justify-between gap-3 mb-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-slate-400">Participant verified</p>
+                    <h4 className="text-lg font-bold text-white mt-1">{checkInPreview.name}</h4>
+                    <p className="text-sm text-slate-300 break-all">{checkInPreview.email}</p>
+                  </div>
+                  <span className={`shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold ${checkInPreview.checked_in ? 'border-amber-700 bg-amber-950 text-amber-300' : 'border-emerald-700 bg-emerald-950 text-emerald-300'}`}>
+                    {checkInPreview.checked_in ? 'ALREADY CHECKED IN' : 'NOT CHECKED IN'}
+                  </span>
+                </div>
+                {checkInPreview.checked_in ? (
+                  <p className="text-xs text-amber-200">This pass has already been used. No changes were made.</p>
+                ) : (
+                  <p className="text-xs text-slate-400">Confirm below to record this participant's entry.</p>
+                )}
+                <div className="flex gap-2 mt-4">
+                  {!checkInPreview.checked_in && (
+                    <button onClick={handleCheckIn} disabled={checkingIn} className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">
+                      {checkingIn && <Loader2 className="h-4 w-4 animate-spin" />}
+                      {checkingIn ? 'Confirming…' : 'Confirm Check-in'}
+                    </button>
+                  )}
+                  <button type="button" onClick={resetCheckInScanner} disabled={checkingIn || verifyingPass} className="rounded-lg border border-slate-700 px-4 py-3 text-sm font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50">
+                    Scan Again
+                  </button>
+                </div>
               </div>
-            </form>
+            )}
 
-            {/* Result feedback box */}
             {checkInResult && (
-              <div className={`p-3 rounded-xl border text-sm mb-4 ${
-                checkInResult.status === 'success' 
-                  ? 'bg-emerald-950/80 border-emerald-800 text-emerald-200' 
-                  : checkInResult.status === 'already_checked_in'
-                  ? 'bg-amber-950/80 border-amber-800 text-amber-200'
-                  : 'bg-red-950/80 border-red-800 text-red-200'
+              <div role="status" className={`p-3 rounded-xl border text-sm mb-4 ${
+                checkInResult.status === 'success' ? 'bg-emerald-950/80 border-emerald-800 text-emerald-200' :
+                checkInResult.status === 'already_checked_in' ? 'bg-amber-950/80 border-amber-800 text-amber-200' :
+                'bg-red-950/80 border-red-800 text-red-200'
               }`}>
                 <div className="font-semibold">{checkInResult.message}</div>
                 {checkInResult.participant && (
-                  <div className="text-xs mt-1 text-slate-300">
-                    Participant: <strong className="text-white">{checkInResult.participant.name}</strong> ({checkInResult.participant.email})
-                  </div>
+                  <div className="text-xs mt-1 text-slate-300">{checkInResult.participant.name}{checkInResult.participant.email ? ` (${checkInResult.participant.email})` : ''}</div>
+                )}
+                {checkInResult.status === 'success' && <p className="mt-1 text-xs">Scanner is ready for the next participant.</p>}
+                {checkInResult.status !== 'success' && !checkInPreview && (
+                  <button type="button" onClick={resetCheckInScanner} className="mt-3 rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800">Scan Next Pass</button>
                 )}
               </div>
             )}
 
             <div className="flex justify-end pt-4 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => {
-                  setShowCheckInModal(false);
-                }}
-                className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white"
-              >
+              <button type="button" onClick={() => { setShowCheckInModal(false); setCheckInPreview(null); setCheckInToken(''); setCheckInResult(null); }} className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white">
                 Close Scanner
               </button>
             </div>
