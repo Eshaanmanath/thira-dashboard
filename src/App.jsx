@@ -9,7 +9,9 @@ import {
   ArrowRight,
   UserPlus,
   Loader2,
-  ShieldAlert
+  ShieldAlert,
+  FileSpreadsheet,
+  X
 } from 'lucide-react';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
@@ -159,6 +161,65 @@ export default function Dashboard() {
       setLoadingUsers(false);
     }
   };
+
+  // Modal State for CSV Import (Drag and Drop)
+  const [showCsvModal, setShowCsvModal] = useState(false);
+  const [selectedCsvFile, setSelectedCsvFile] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadingCsv, setUploadingCsv] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleFileDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      if (file.name.endsWith('.csv')) {
+        setSelectedCsvFile(file);
+      } else {
+        alert("Please drop a valid .csv file.");
+      }
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleCsvUploadSubmit = async (e) => {
+    e.preventDefault();
+    if (!selectedCsvFile || !selectedEvent) return;
+
+    const formData = new FormData();
+    formData.append("file", selectedCsvFile);
+
+    try {
+      setUploadingCsv(true);
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/import-csv`, {
+        method: 'POST',
+        body: formData
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Failed to upload CSV");
+      }
+      const result = await res.json();
+      alert(`CSV Import Successful!\n- Added: ${result.added} new participants\n- Skipped: ${result.skipped} duplicate(s)`);
+      setShowCsvModal(false);
+      setSelectedCsvFile(null);
+    } catch (err) {
+      alert("Error: " + err.message);
+    } finally {
+      setUploadingCsv(false);
+    }
+  };
+
   // Modal State for Email Passes
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [emailPayload, setEmailPayload] = useState({
@@ -198,6 +259,7 @@ export default function Dashboard() {
       setSendingEmails(false);
     }
   };
+
   // Modal State for New Event Creation
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newEvent, setNewEvent] = useState({ 
@@ -288,7 +350,7 @@ export default function Dashboard() {
     }
   };
 
-  // QR scanner: scan/verify first, then explicitly confirm check-in.
+  // QR scanner states
   const [showCheckInModal, setShowCheckInModal] = useState(false);
   const [checkInToken, setCheckInToken] = useState('');
   const [checkInPreview, setCheckInPreview] = useState(null);
@@ -347,7 +409,6 @@ export default function Dashboard() {
       setCheckInResult(data);
       setCheckInToken('');
       setCheckInPreview(null);
-      // After a confirmed successful check-in, restart the camera immediately for the next person.
       if (data.status === 'success') {
         scannerLockRef.current = false;
         setScannerCycle((cycle) => cycle + 1);
@@ -381,7 +442,6 @@ export default function Dashboard() {
 
       scanner.render(
         async (decodedText) => {
-          // Lock immediately: the same QR can be decoded across several frames.
           if (scannerLockRef.current) return;
           scannerLockRef.current = true;
           try {
@@ -391,9 +451,7 @@ export default function Dashboard() {
           }
           await verifyPass(decodedText);
         },
-        () => {
-          // No QR in the current frame is expected while waiting for a pass.
-        }
+        () => {}
       );
     }, 100);
 
@@ -694,42 +752,12 @@ export default function Dashboard() {
                       Restricted: Volunteers cannot import CSVs
                     </div>
                   ) : (
-                    <>
-                      <input
-                        type="file"
-                        accept=".csv"
-                        id={`csv-upload-${selectedEvent.id}`}
-                        className="hidden"
-                        onChange={async (e) => {
-                          const file = e.target.files[0];
-                          if (!file) return;
-
-                          const formData = new FormData();
-                          formData.append("file", file);
-
-                          try {
-                            const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/import-csv`, {
-                              method: 'POST',
-                              body: formData
-                            });
-                            if (!res.ok) {
-                              const err = await res.json();
-                              throw new Error(err.detail || "Failed to upload CSV");
-                            }
-                            const result = await res.json();
-                            alert(`CSV Import Successful!\n- Added: ${result.added} new participants\n- Skipped: ${result.skipped} duplicate(s)`);
-                          } catch (err) {
-                            alert("Error: " + err.message);
-                          }
-                        }}
-                      />
-                      <label 
-                        htmlFor={`csv-upload-${selectedEvent.id}`}
-                        className="w-full cursor-pointer block text-center py-2.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white rounded-lg transition-colors shadow-md"
-                      >
-                        Upload Participant CSV
-                      </label>
-                    </>
+                    <button 
+                      onClick={() => { setSelectedCsvFile(null); setShowCsvModal(true); }}
+                      className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white rounded-lg transition-colors shadow-md"
+                    >
+                      Upload Participant CSV
+                    </button>
                   )}
                 </div>
               </div>
@@ -851,6 +879,98 @@ export default function Dashboard() {
                 >
                   {submittingEvent && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                   Create Event
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: DRAG & DROP CSV UPLOAD */}
+      {showCsvModal && selectedEvent && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-950 border border-slate-800 w-full max-w-md rounded-2xl p-6 relative">
+            <button
+              onClick={() => setShowCsvModal(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <h3 className="text-lg font-bold text-white mb-1">Import Participant CSV</h3>
+            <p className="text-xs text-slate-400 mb-6">
+              Upload Google Forms export for <span className="text-indigo-400 font-medium">{selectedEvent.name}</span>.
+            </p>
+
+            <form onSubmit={handleCsvUploadSubmit} className="space-y-4">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files && e.target.files[0]) {
+                    setSelectedCsvFile(e.target.files[0]);
+                  }
+                }}
+              />
+
+              {/* DROP ZONE */}
+              <div
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleFileDrop}
+                onClick={() => fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
+                  isDragging
+                    ? 'border-indigo-500 bg-indigo-950/30 scale-[0.99]'
+                    : selectedCsvFile
+                    ? 'border-emerald-500/50 bg-emerald-950/10'
+                    : 'border-slate-800 hover:border-slate-700 bg-slate-900/50'
+                }`}
+              >
+                {selectedCsvFile ? (
+                  <div className="flex flex-col items-center">
+                    <FileSpreadsheet className="w-10 h-10 text-emerald-400 mb-2" />
+                    <p className="text-sm font-semibold text-white break-all">{selectedCsvFile.name}</p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {(selectedCsvFile.size / 1024).toFixed(1)} KB
+                    </p>
+                    <span className="mt-3 text-[11px] text-emerald-400 underline">Click or drop to replace</span>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center">
+                    <Upload className="w-10 h-10 text-indigo-400 mb-3" />
+                    <p className="text-sm font-semibold text-white">Drag & drop your CSV file here</p>
+                    <p className="text-xs text-slate-400 mt-1 mb-4">Supports .csv exported from Google Forms</p>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        fileInputRef.current?.click();
+                      }}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 rounded-lg border border-slate-700 transition-colors"
+                    >
+                      Browse Files
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowCsvModal(false)}
+                  className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={!selectedCsvFile || uploadingCsv}
+                  className="flex items-center gap-2 px-5 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-all disabled:opacity-50 shadow-lg shadow-indigo-600/20"
+                >
+                  {uploadingCsv && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {uploadingCsv ? 'Importing...' : 'Upload & Import'}
                 </button>
               </div>
             </form>
@@ -1018,11 +1138,11 @@ export default function Dashboard() {
         </div>
       )}
 
-            {/* MODAL: CREATE USER */}
-            {showUserModal && (
-              <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-                <div className="bg-slate-950 border border-slate-800 w-full max-w-md rounded-2xl p-6">
-                  <h3 className="text-lg font-bold text-white mb-1">Add New Team User</h3>
+      {/* MODAL: CREATE USER */}
+      {showUserModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-950 border border-slate-800 w-full max-w-md rounded-2xl p-6">
+            <h3 className="text-lg font-bold text-white mb-1">Add New Team User</h3>
             <p className="text-xs text-slate-400 mb-6">
               {currentRole === 'Core' ? 'As Core, you can create Core, Event Head, or Volunteer accounts.' : 'As Event Head, you can create Volunteer accounts.'}
             </p>
