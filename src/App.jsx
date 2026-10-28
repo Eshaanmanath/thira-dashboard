@@ -13,12 +13,33 @@ import {
 } from 'lucide-react';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const TOKEN_KEY = "thira_access_token";
+
+async function apiFetch(url, options = {}) {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const headers = new Headers(options.headers || {});
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  // The backend derives identity and role from the JWT; never trust a role supplied by the UI.
+  headers.delete("x-user-role");
+  const response = await fetch(url, { ...options, headers });
+  if (response.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    window.dispatchEvent(new Event('thira:unauthorized'));
+  }
+  return response;
+}
 
 export default function Dashboard() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
   const [activeTab, setActiveTab] = useState('events');
   const [selectedEvent, setSelectedEvent] = useState(null);
-  const [currentRole, setCurrentRole] = useState('Core');
+  const currentRole = currentUser?.role || null;
 
   // Real Database States
   const [events, setEvents] = useState([]);
@@ -27,16 +48,93 @@ export default function Dashboard() {
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [error, setError] = useState(null);
 
-  // Fetch events and users on mount & role change
   useEffect(() => {
-    fetchEvents();
-    fetchUsers();
+    const onUnauthorized = () => {
+      setCurrentUser(null);
+      setSelectedEvent(null);
+      setEvents([]);
+      setUsers([]);
+    };
+    window.addEventListener('thira:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('thira:unauthorized', onUnauthorized);
   }, []);
+
+  // Restore a previously authenticated session, if the token is still valid.
+  useEffect(() => {
+    const restoreSession = async () => {
+      const token = localStorage.getItem(TOKEN_KEY);
+      if (!token) {
+        setAuthChecking(false);
+        setLoadingEvents(false);
+        return;
+      }
+      try {
+        const res = await fetch(`${API_BASE}/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error('Session expired');
+        const user = await res.json();
+        setCurrentUser(user);
+        await fetchEvents();
+        if (user.role === 'Core') await fetchUsers();
+      } catch {
+        localStorage.removeItem(TOKEN_KEY);
+        setCurrentUser(null);
+        setLoadingEvents(false);
+      } finally {
+        setAuthChecking(false);
+      }
+    };
+    restoreSession();
+  }, []);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoginError('');
+    setLoggingIn(true);
+    try {
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Login failed');
+      localStorage.setItem(TOKEN_KEY, data.access_token);
+      const meRes = await fetch(`${API_BASE}/auth/me`, {
+        headers: { Authorization: `Bearer ${data.access_token}` },
+      });
+      const me = await meRes.json();
+      if (!meRes.ok) throw new Error(me.detail || 'Could not load your account');
+      setCurrentUser(me);
+      setLoginPassword('');
+      setError(null);
+      await fetchEvents();
+      if (me.role === 'Core') await fetchUsers();
+    } catch (err) {
+      localStorage.removeItem(TOKEN_KEY);
+      setLoginError(err.message || 'Unable to sign in');
+    } finally {
+      setLoggingIn(false);
+      setAuthChecking(false);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    setCurrentUser(null);
+    setSelectedEvent(null);
+    setEvents([]);
+    setUsers([]);
+    setActiveTab('events');
+    setError(null);
+    setLoginPassword('');
+  };
 
   const fetchEvents = async () => {
     try {
       setLoadingEvents(true);
-      const res = await fetch(`${API_BASE}/events`);
+      const res = await apiFetch(`${API_BASE}/events`);
       if (!res.ok) throw new Error("Failed to fetch events");
       const data = await res.json();
       setEvents(data);
@@ -51,7 +149,7 @@ export default function Dashboard() {
   const fetchUsers = async () => {
     try {
       setLoadingUsers(true);
-      const res = await fetch(`${API_BASE}/users`);
+      const res = await apiFetch(`${API_BASE}/users`);
       if (!res.ok) throw new Error("Failed to fetch users");
       const data = await res.json();
       setUsers(data);
@@ -75,11 +173,10 @@ export default function Dashboard() {
 
     try {
       setSendingEmails(true);
-      const res = await fetch(`${API_BASE}/events/${selectedEvent.id}/send-passes`, {
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/send-passes`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-role': currentRole 
         },
         body: JSON.stringify({
           subject: emailPayload.subject,
@@ -136,11 +233,10 @@ export default function Dashboard() {
         status: newEvent.status || "Registrations Open"
       };
 
-      const res = await fetch(`${API_BASE}/events`, {
+      const res = await apiFetch(`${API_BASE}/events`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-role': currentRole 
         },
         body: JSON.stringify(payload)
       });
@@ -167,11 +263,10 @@ export default function Dashboard() {
 
     try {
       setSubmittingUser(true);
-      const res = await fetch(`${API_BASE}/users`, {
+      const res = await apiFetch(`${API_BASE}/users`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-role': currentRole 
         },
         body: JSON.stringify(newUser)
       });
@@ -207,11 +302,10 @@ export default function Dashboard() {
       setCheckingIn(true);
       setCheckInResult(null);
 
-      const res = await fetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-user-role': currentRole 
         },
         body: JSON.stringify({ qr_token: checkInToken })
       });
@@ -244,12 +338,11 @@ export default function Dashboard() {
           setCheckInToken(decodedText);
           // Automatically trigger check-in API with scanned token
           try {
-            const res = await fetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
+            const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/check-in`, {
               method: 'POST',
               headers: { 
                 'Content-Type': 'application/json',
-                'x-user-role': currentRole 
-              },
+                    },
               body: JSON.stringify({ qr_token: decodedText.trim() })
             });
             const data = await res.json();
@@ -273,6 +366,29 @@ export default function Dashboard() {
     };
   }
 }, [showCheckInModal, selectedEvent]);
+
+  if (authChecking) {
+    return <div className="flex min-h-screen items-center justify-center bg-slate-900 text-slate-200"><Loader2 className="mr-3 h-5 w-5 animate-spin text-indigo-400" /> Checking session...</div>;
+  }
+
+  if (!currentUser) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-900 px-4 text-slate-100">
+        <form onSubmit={handleLogin} className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-950 p-8 shadow-2xl">
+          <h1 className="mb-1 text-2xl font-bold text-indigo-400">thira<span className="text-white">-cochin</span></h1>
+          <p className="mb-6 text-sm text-slate-400">Sign in to your event dashboard</p>
+          {loginError && <div role="alert" className="mb-4 rounded-lg border border-red-800 bg-red-950/60 p-3 text-sm text-red-200">{loginError}</div>}
+          <label className="mb-1 block text-sm text-slate-300" htmlFor="login-email">Email</label>
+          <input id="login-email" type="email" autoComplete="username" required value={loginEmail} onChange={e => setLoginEmail(e.target.value)} className="mb-4 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm text-white outline-none focus:border-indigo-500" />
+          <label className="mb-1 block text-sm text-slate-300" htmlFor="login-password">Password</label>
+          <input id="login-password" type="password" autoComplete="current-password" required value={loginPassword} onChange={e => setLoginPassword(e.target.value)} className="mb-6 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm text-white outline-none focus:border-indigo-500" />
+          <button type="submit" disabled={loggingIn} className="flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-60">
+            {loggingIn && <Loader2 className="h-4 w-4 animate-spin" />}{loggingIn ? 'Signing in...' : 'Sign in'}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-slate-900 text-slate-100 font-sans">
@@ -299,7 +415,7 @@ export default function Dashboard() {
               Events
             </button>
 
-            <button
+            {currentRole === 'Core' && <button
               onClick={() => { setActiveTab('users'); setSelectedEvent(null); }}
               className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors ${
                 activeTab === 'users' 
@@ -309,23 +425,17 @@ export default function Dashboard() {
             >
               <Users className="w-5 h-5" />
               Users & Roles
-            </button>
+            </button>}
           </nav>
         </div>
 
         <div className="p-4 border-t border-slate-800 bg-slate-900/50">
-          <label className="text-xs text-slate-400 block mb-2 font-medium">
-            Simulate Role:
-          </label>
-          <select 
-            value={currentRole}
-            onChange={(e) => setCurrentRole(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded-md p-2 focus:ring-2 focus:ring-indigo-500"
-          >
-            <option value="Core">Core (Full Access)</option>
-            <option value="Event Head">Event Head</option>
-            <option value="Volunteer">Volunteer</option>
-          </select>
+          <div className="mb-3">
+            <p className="text-sm font-semibold text-white">{currentUser?.name}</p>
+            <p className="text-xs text-slate-400">{currentUser?.email}</p>
+            <span className="mt-2 inline-block rounded-full border border-indigo-800 bg-indigo-950 px-2 py-1 text-xs text-indigo-300">{currentRole}</span>
+          </div>
+          <button onClick={handleLogout} className="w-full rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800">Sign out</button>
         </div>
       </aside>
 
@@ -430,18 +540,18 @@ export default function Dashboard() {
                 <p className="text-slate-400 text-sm mt-1">Manage team permissions across Core, Event Head, and Volunteer roles.</p>
               </div>
 
-              {currentRole !== 'Volunteer' ? (
+              {currentRole === 'Core' ? (
                 <button
                   onClick={() => setShowUserModal(true)}
                   className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2.5 rounded-lg text-sm font-semibold transition-all shadow-lg shadow-indigo-600/20"
                 >
                   <UserPlus className="w-4 h-4" />
-                  {currentRole === 'Core' ? 'Add User (Core / Head / Volunteer)' : 'Add Volunteer'}
+                  Add User
                 </button>
               ) : (
                 <div className="flex items-center gap-2 text-xs bg-slate-800 text-slate-400 px-3 py-2 rounded-md border border-slate-700">
                   <ShieldAlert className="w-4 h-4 text-amber-400" />
-                  <span>Volunteers cannot add users</span>
+                  <span>Only Core can manage users</span>
                 </div>
               )}
             </div>
@@ -551,9 +661,8 @@ export default function Dashboard() {
                           formData.append("file", file);
 
                           try {
-                            const res = await fetch(`${API_BASE}/events/${selectedEvent.id}/import-csv`, {
+                            const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/import-csv`, {
                               method: 'POST',
-                              headers: { 'x-user-role': currentRole },
                               body: formData
                             });
                             if (!res.ok) {

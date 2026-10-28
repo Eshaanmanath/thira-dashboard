@@ -10,12 +10,16 @@ from sqlalchemy.orm import Session
 from database import engine, Base, get_db
 import models
 import hashlib
+import html
+import re
 import binascii
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from datetime import datetime
+from urllib.parse import quote
+from sqlalchemy import or_, update
 from security import (
     create_access_token,
     get_current_user,
@@ -48,7 +52,12 @@ class EmailPassRequest(BaseModel):
 # --- Helper function for HTML Email generation ---
 def generate_pass_html(participant_name: str, event_name: str, event_date: str, qr_token: str, message: str) -> str:
     # Uses QuickChart API to render a live embedded QR code image from the unique QR token
-    qr_image_url = f"https://quickchart.io/qr?text={qr_token}&size=200&margin=2"
+    safe_qr_token = quote(qr_token, safe="")
+    qr_image_url = f"https://quickchart.io/qr?text={safe_qr_token}&size=200&margin=2"
+    safe_event_name = html.escape(event_name)
+    safe_event_date = html.escape(event_date)
+    safe_qr_token_text = html.escape(qr_token)
+    safe_message = html.escape(message or "").replace("\\n", "<br>")
     
     return f"""
     <!DOCTYPE html>
@@ -69,16 +78,16 @@ def generate_pass_html(participant_name: str, event_name: str, event_date: str, 
     <body>
         <div class="card">
             <div class="brand">thira-cochin</div>
-            <div class="title">{event_name}</div>
-            <div class="date">📅 {event_date}</div>
+            <div class="title">{safe_event_name}</div>
+            <div class="date">📅 {safe_event_date}</div>
             
-            <p className="msg">{message}</p>
+            <p class="msg">{safe_message}</p>
             
             <div class="qr-box">
                 <img src="{qr_image_url}" alt="Entry QR Code" width="180" height="180" />
             </div>
             
-            <div className="token">PASS TOKEN: {qr_token}</div>
+            <div class="token">PASS TOKEN: {safe_qr_token_text}</div>
             <p style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Show this QR code or token to volunteers at gate entry.</p>
             
             <div class="footer">
@@ -393,52 +402,109 @@ async def import_participants_csv(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    contents = await file.read()
-    decoded = contents.decode("utf-8", errors="ignore")
-    io_stream = io.StringIO(decoded)
-    reader = csv.DictReader(io_stream)
-    
-    added_count = 0
-    skipped_count = 0
+    # Bound upload size before decoding/parsing to avoid excessive memory use.
+    MAX_CSV_BYTES = 5 * 1024 * 1024
+    MAX_CSV_ROWS = 10000
+    contents = await file.read(MAX_CSV_BYTES + 1)
+    if len(contents) > MAX_CSV_BYTES:
+        raise HTTPException(status_code=413, detail="CSV file exceeds the 5 MB limit")
+    if not contents:
+        raise HTTPException(status_code=400, detail="The uploaded CSV file is empty")
 
-    for row in reader:
-        normalized_row = {k.strip().lower(): v.strip() for k, v in row.items() if k}
-        name = normalized_row.get("name") or normalized_row.get("full name") or normalized_row.get("participant name")
-        email = normalized_row.get("email") or normalized_row.get("email address")
-        phone = normalized_row.get("phone") or normalized_row.get("phone number") or normalized_row.get("mobile")
+    try:
+        decoded = contents.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV must be encoded as UTF-8")
 
-        if not email or not name:
-            continue
+    try:
+        reader = csv.DictReader(io.StringIO(decoded, newline=""))
+        if not reader.fieldnames:
+            raise HTTPException(status_code=400, detail="CSV header row is missing")
 
-        email = email.lower()
-        name = name.strip()
+        # Normalize headers and reject malformed/duplicate headers.
+        headers = [h.strip().lower() if h else "" for h in reader.fieldnames]
+        if any(not h for h in headers) or len(set(headers)) != len(headers):
+            raise HTTPException(status_code=400, detail="CSV contains blank or duplicate column headers")
 
-        existing = db.query(models.Participant).filter(
-            models.Participant.event_id == event_id,
-            models.Participant.email == email,
-            models.Participant.name == name
-        ).first()
+        name_columns = ("name", "full name", "participant name")
+        email_columns = ("email", "email address")
+        phone_columns = ("phone", "phone number", "mobile")
+        if not any(h in headers for h in name_columns) or not any(h in headers for h in email_columns):
+            raise HTTPException(
+                status_code=400,
+                detail="CSV must contain name and email columns",
+            )
 
-        if existing:
-            skipped_count += 1
-            continue
+        added_count = 0
+        skipped_count = 0
+        seen_rows = set()
 
-        new_participant = models.Participant(
-            event_id=event_id,
-            name=name,
-            email=email,
-            phone=phone
-        )
-        db.add(new_participant)
-        added_count += 1
+        for row_number, row in enumerate(reader, start=2):
+            if row_number > MAX_CSV_ROWS + 1:
+                raise HTTPException(status_code=413, detail=f"CSV exceeds the {MAX_CSV_ROWS}-row limit")
+            # DictReader uses key None when a row has more cells than the header.
+            if None in row:
+                skipped_count += 1
+                continue
 
-    db.commit()
+            normalized_row = {
+                (key.strip().lower() if key else ""): (value.strip() if value else "")
+                for key, value in row.items()
+                if key
+            }
+            name = next((normalized_row.get(k) for k in name_columns if normalized_row.get(k)), "")
+            email = next((normalized_row.get(k) for k in email_columns if normalized_row.get(k)), "").strip().lower()
+            phone = next((normalized_row.get(k) for k in phone_columns if normalized_row.get(k)), None)
+
+            if not name or not email:
+                skipped_count += 1
+                continue
+            if len(name) > 255 or len(email) > 320 or (phone and len(phone) > 50):
+                skipped_count += 1
+                continue
+            if not re.fullmatch(r"[^\\s@]+@[^\\s@]+\\.[^\\s@]+", email):
+                skipped_count += 1
+                continue
+
+            row_key = (name.casefold(), email)
+            if row_key in seen_rows:
+                skipped_count += 1
+                continue
+            seen_rows.add(row_key)
+
+            existing = db.query(models.Participant).filter(
+                models.Participant.event_id == event_id,
+                models.Participant.email == email,
+                models.Participant.name == name,
+            ).first()
+            if existing:
+                skipped_count += 1
+                continue
+
+            db.add(models.Participant(
+                event_id=event_id,
+                name=name,
+                email=email,
+                phone=phone or None,
+            ))
+            added_count += 1
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except csv.Error:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="CSV file could not be parsed")
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "message": "CSV imported successfully",
         "added": added_count,
         "skipped": skipped_count,
-        "total_processed": added_count + skipped_count
+        "total_processed": added_count + skipped_count,
     }
 
 # --- USER MANAGEMENT ENDPOINTS ---
@@ -674,41 +740,67 @@ def check_in_participant(
     require_event_access(event_id, current_user, db)
 
     token = payload.qr_token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="QR pass token cannot be empty")
+
     participant = db.query(models.Participant).filter(
         models.Participant.event_id == event_id,
-        models.Participant.qr_token == token
+        models.Participant.qr_token == token,
     ).first()
 
-    if not participant:
-        raise HTTPException(status_code=404, detail="Invalid QR Pass Token. Participant not found for this event.")
+    if participant is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Invalid QR Pass Token. Participant not found for this event.",
+        )
 
-    if participant.checked_in:
-        return {
-            "status": "already_checked_in",
-            "message": f"⚠️ Warning: {participant.name} was already checked in!",
-            "participant": {
-                "name": participant.name,
-                "email": participant.email,
-                "checked_in_at": "Earlier"
-            }
-        }
-
-    # Mark as checked in
-    participant.checked_in = True
-    participant.checked_in_at = datetime.utcnow()
-    participant.checked_in_by_id = current_user.id
-
+    # Conditional UPDATE makes the check-in atomic: only one concurrent request
+    # can change a participant from not checked in to checked in.
+    checked_in_at = datetime.utcnow()
+    result = db.query(models.Participant).filter(
+        models.Participant.id == participant.id,
+        or_(
+            models.Participant.checked_in.is_(False),
+            models.Participant.checked_in.is_(None),
+        ),
+    ).update(
+        {
+            models.Participant.checked_in: True,
+            models.Participant.checked_in_at: checked_in_at,
+            models.Participant.checked_in_by_id: current_user.id,
+        },
+        synchronize_session=False,
+    )
     db.commit()
     db.refresh(participant)
 
+    if result == 0:
+        return {
+            "status": "already_checked_in",
+            "message": f"Warning: {participant.name} was already checked in!",
+            "participant": {
+                "name": participant.name,
+                "email": participant.email,
+                "checked_in_at": (
+                    participant.checked_in_at.isoformat()
+                    if participant.checked_in_at else None
+                ),
+            },
+        }
+
     return {
         "status": "success",
-        "message": f"✅ Check-in successful for {participant.name}!",
+        "message": f"Check-in successful for {participant.name}!",
         "participant": {
             "name": participant.name,
-            "email": participant.email
-        }
+            "email": participant.email,
+            "checked_in_at": (
+                participant.checked_in_at.isoformat()
+                if participant.checked_in_at else checked_in_at.isoformat()
+            ),
+        },
     }
+
 
 
 @app.post("/auth/login", response_model=TokenResponse)
