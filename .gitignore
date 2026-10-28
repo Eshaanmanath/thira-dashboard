@@ -47,3 +47,5 @@ dist/
 # Editor and OS files
 .vscode/
 .DS_Store
+
+migrate_event_head_memberships.py

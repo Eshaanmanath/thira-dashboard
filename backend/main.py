@@ -24,6 +24,7 @@ from security import (
 )
 
 load_dotenv()
+
 # Password hashing setup
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
@@ -173,6 +174,9 @@ class CurrentUserResponse(BaseModel):
 class VolunteerAssignment(BaseModel):
     user_id: str
 
+class EventHeadAssignments(BaseModel):
+    user_ids: List[str] = Field(default_factory=list, max_length=2)
+
 
 # --- API Endpoints ---
 @app.get("/")
@@ -224,6 +228,38 @@ def get_events(
 
     return response
 
+def resolve_event_head(db: Session, identifier: Optional[str]) -> Optional[models.User]:
+    """Resolve an Event Head by user ID or email; never by display name."""
+    if not identifier or identifier.strip().casefold() in {"unassigned", "none", "null"}:
+        return None
+
+    value = identifier.strip()
+    user = db.query(models.User).filter(
+        (models.User.id == value) | (models.User.email == value.casefold())
+    ).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No user found for Event Head identifier: {value}",
+        )
+    if user.role != models.UserRole.EVENT_HEAD:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"User {user.email} is not an Event Head",
+        )
+    return user
+
+
+def add_event_membership(db: Session, event_id: str, user_id: str) -> None:
+    existing = db.query(models.EventMembership).filter(
+        models.EventMembership.event_id == event_id,
+        models.EventMembership.user_id == user_id,
+    ).first()
+    if not existing:
+        db.add(models.EventMembership(event_id=event_id, user_id=user_id))
+
+
 @app.post("/events", response_model=EventResponse, status_code=status.HTTP_201_CREATED)
 def create_event(
     event: EventCreate,
@@ -232,27 +268,106 @@ def create_event(
         require_roles(models.UserRole.CORE)
     ),
 ):
+    # The UI may send an Event Head's email or user ID. Authorization is stored
+    # only in EventMembership; the old event_head fields remain display-only for
+    # backward compatibility with the current frontend.
+    head1 = resolve_event_head(db, event.event_head_1)
+    head2 = resolve_event_head(db, event.event_head_2)
+    if head1 and head2 and head1.id == head2.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Choose two different Event Heads or leave the second unassigned",
+        )
 
     db_event = models.Event(
         name=event.name,
         event_date=event.event_date,
-        event_head_1=event.event_head_1,
-        event_head_2=event.event_head_2,
-        status=event.status
+        event_head_1=head1.email if head1 else None,
+        event_head_2=head2.email if head2 else None,
+        status=event.status,
     )
-    db.add(db_event)
-    db.commit()
-    db.refresh(db_event)
-    
+    try:
+        db.add(db_event)
+        db.flush()
+        if head1:
+            add_event_membership(db, db_event.id, head1.id)
+        if head2:
+            add_event_membership(db, db_event.id, head2.id)
+        db.commit()
+        db.refresh(db_event)
+    except Exception:
+        db.rollback()
+        raise
+
     return {
         "id": db_event.id,
         "name": db_event.name,
         "event_date": db_event.event_date,
         "event_head_1": db_event.event_head_1 or "Unassigned",
         "event_head_2": db_event.event_head_2 or "Unassigned",
-        "status": db_event.status.value if hasattr(db_event.status, 'value') else db_event.status,
-        "created_at": db_event.created_at.strftime("%Y-%m-%d")
+        "status": db_event.status.value if hasattr(db_event.status, "value") else db_event.status,
+        "created_at": db_event.created_at.strftime("%Y-%m-%d") if db_event.created_at else "",
     }
+
+
+@app.put("/events/{event_id}/event-heads")
+def assign_event_heads(
+    event_id: str,
+    payload: EventHeadAssignments,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles(models.UserRole.CORE)),
+):
+    """Replace the Event Head assignments for an event (Core only)."""
+    event = db.query(models.Event).filter(models.Event.id == event_id).first()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Normalize and validate the submitted user IDs, and disallow duplicates.
+    ids = [value.strip() for value in payload.user_ids if value and value.strip()]
+    if len(ids) > 2:
+        raise HTTPException(status_code=400, detail="An event can have at most two Event Heads")
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=400, detail="Duplicate Event Head user IDs are not allowed")
+
+    heads = []
+    for user_id in ids:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
+        if user.role != models.UserRole.EVENT_HEAD:
+            raise HTTPException(status_code=400, detail=f"{user.email} is not an Event Head")
+        heads.append(user)
+
+    try:
+        # Remove only Event Head memberships; preserve Volunteer memberships.
+        existing_head_memberships = (
+            db.query(models.EventMembership)
+            .join(models.User, models.EventMembership.user_id == models.User.id)
+            .filter(
+                models.EventMembership.event_id == event_id,
+                models.User.role == models.UserRole.EVENT_HEAD,
+            )
+            .all()
+        )
+        for membership in existing_head_memberships:
+            db.delete(membership)
+
+        for head in heads:
+            add_event_membership(db, event_id, head.id)
+
+        event.event_head_1 = heads[0].email if len(heads) >= 1 else None
+        event.event_head_2 = heads[1].email if len(heads) >= 2 else None
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "message": "Event Head assignments updated",
+        "event_id": event_id,
+        "event_heads": [{"id": user.id, "name": user.name, "email": user.email} for user in heads],
+    }
+
 
 # --- CSV IMPORT ENDPOINT ---
 @app.post("/events/{event_id}/import-csv")
