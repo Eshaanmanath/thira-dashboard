@@ -1,0 +1,99 @@
+import enum
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Enum, UniqueConstraint
+from sqlalchemy.orm import relationship
+from database import Base
+
+class UserRole(str, enum.Enum):
+    CORE = "Core"
+    EVENT_HEAD = "Event Head"
+    VOLUNTEER = "Volunteer"
+
+class EventStatus(str, enum.Enum):
+    REGISTRATIONS_OPEN = "Registrations Open"
+    ONGOING = "Ongoing"
+    COMPLETED = "Completed"
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(Enum(UserRole), default=UserRole.VOLUNTEER, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    checked_in_participants = relationship("Participant", back_populates="checked_in_by_volunteer")
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    event_date = Column(String, nullable=False)
+    status = Column(Enum(EventStatus), default=EventStatus.REGISTRATIONS_OPEN, nullable=False)
+    
+    # Event Heads (Foreign keys to User)
+    event_head_1 = Column(String, nullable=True) # Name/Email or User ID of Event Head 1
+    event_head_2 = Column(String, nullable=True) # Name/Email or User ID of Event Head 2
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    participants = relationship("Participant", back_populates="event", cascade="all, delete-orphan")
+
+
+class EventMembership(Base):
+    __tablename__ = "event_memberships"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            "user_id",
+            name="uq_event_membership",
+        ),
+    )
+
+    id = Column(
+        String,
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+
+    event_id = Column(
+        String,
+        ForeignKey("events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    event = relationship("Event")
+    user = relationship("User")
+
+
+class Participant(Base):
+    __tablename__ = "participants"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_id = Column(String, ForeignKey("events.id"), nullable=False)
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False, index=True)
+    phone = Column(String, nullable=True)
+    qr_token = Column(String, unique=True, index=True, default=lambda: f"THIRA-{uuid.uuid4().hex[:8].upper()}")
+    
+    checked_in = Column(Boolean, default=False)
+    checked_in_at = Column(DateTime, nullable=True)
+    checked_in_by_id = Column(String, ForeignKey("users.id"), nullable=True)
+
+    event = relationship("Event", back_populates="participants")
+    checked_in_by_volunteer = relationship("User", back_populates="checked_in_participants")

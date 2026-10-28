@@ -1,0 +1,634 @@
+import csv
+import io
+import os
+from contextlib import asynccontextmanager
+from typing import Optional, List
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, EmailStr
+from sqlalchemy.orm import Session
+from database import engine, Base, get_db
+import models
+import hashlib
+import binascii
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+from datetime import datetime
+from security import (
+    create_access_token,
+    get_current_user,
+    require_roles,
+    require_event_access,
+)
+
+load_dotenv()
+# Password hashing setup
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return binascii.hexlify(salt).decode('ascii') + ":" + binascii.hexlify(pwd_hash).decode('ascii')
+
+def verify_password(stored_password: str, provided_password: str) -> bool:
+    try:
+        salt_hex, hash_hex = stored_password.split(':')
+        salt = binascii.unhexlify(salt_hex)
+        pwd_hash = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
+        return pwd_hash == binascii.unhexlify(hash_hex)
+    except Exception:
+        return False
+
+# --- Email Request Schema ---
+class EmailPassRequest(BaseModel):
+    subject: str = "Your Entry Pass for {event_name}"
+    custom_message: Optional[str] = "We are excited to welcome you! Please present the attached QR code token at the entry gate."
+
+# --- Helper function for HTML Email generation ---
+def generate_pass_html(participant_name: str, event_name: str, event_date: str, qr_token: str, message: str) -> str:
+    # Uses QuickChart API to render a live embedded QR code image from the unique QR token
+    qr_image_url = f"https://quickchart.io/qr?text={qr_token}&size=200&margin=2"
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 20px; }}
+            .card {{ max-width: 480px; margin: 0 auto; background-color: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; text-align: center; }}
+            .brand {{ color: #818cf8; font-size: 20px; font-weight: bold; margin-bottom: 8px; }}
+            .title {{ font-size: 22px; font-weight: bold; color: #ffffff; margin-bottom: 4px; }}
+            .date {{ color: #94a3b8; font-size: 14px; margin-bottom: 20px; }}
+            .msg {{ font-size: 14px; color: #cbd5e1; line-height: 1.5; text-align: left; background: #0f172a; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; }}
+            .qr-box {{ background: #ffffff; padding: 16px; border-radius: 12px; display: inline-block; margin-bottom: 12px; }}
+            .token {{ font-family: monospace; font-size: 16px; letter-spacing: 2px; color: #818cf8; font-weight: bold; }}
+            .footer {{ font-size: 11px; color: #64748b; margin-top: 24px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="brand">thira-cochin</div>
+            <div class="title">{event_name}</div>
+            <div class="date">📅 {event_date}</div>
+            
+            <p className="msg">{message}</p>
+            
+            <div class="qr-box">
+                <img src="{qr_image_url}" alt="Entry QR Code" width="180" height="180" />
+            </div>
+            
+            <div className="token">PASS TOKEN: {qr_token}</div>
+            <p style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Show this QR code or token to volunteers at gate entry.</p>
+            
+            <div class="footer">
+                This is an automated pass issued by dashboard.thira-cochin.in
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    models.Base.metadata.create_all(bind=engine)
+    print("🚀 FastAPI Backend Running & Connected to Supabase PostgreSQL!")
+    yield
+    print("👋 FastAPI Server shutting down...")
+
+app = FastAPI(
+    title="Thira Cochin Dashboard API",
+    version="1.0.0",
+    docs_url="/docs",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "https://dashboard.thira-cochin.in"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Pydantic Schemas ---
+class EventCreate(BaseModel):
+    name: str
+    event_date: str = Field(..., alias="eventDate")
+    event_head_1: Optional[str] = Field(None, alias="eventHead1")
+    event_head_2: Optional[str] = Field(None, alias="eventHead2")
+    status: Optional[str] = "Registrations Open"
+
+    class Config:
+        populate_by_name = True
+
+class EventResponse(BaseModel):
+    id: str
+    name: str
+    event_date: str
+    event_head_1: Optional[str] = None
+    event_head_2: Optional[str] = None
+    status: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: models.UserRole  # "Core", "Event Head", or "Volunteer"
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    role: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+        
+class CheckInRequest(BaseModel):
+    qr_token: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = 1800
+
+
+class CurrentUserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    role: str
+
+class VolunteerAssignment(BaseModel):
+    user_id: str
+
+
+# --- API Endpoints ---
+@app.get("/")
+def read_root():
+    return {"message": "Thira Cochin Dashboard API is live!"}
+
+@app.get("/health")
+def health_check(db: Session = Depends(get_db)):
+    return {"status": "connected_to_supabase_db"}
+
+# --- EVENT ENDPOINTS ---
+@app.get("/events", response_model=List[EventResponse])
+def get_events(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    all_events = db.query(models.Event).order_by(
+        models.Event.created_at.desc()
+    ).all()
+
+    visible_events = []
+
+    for event in all_events:
+        try:
+            require_event_access(event.id, current_user, db)
+            visible_events.append(event)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+
+    response = []
+    for evt in visible_events:
+        response.append({
+            "id": evt.id,
+            "name": evt.name,
+            "event_date": evt.event_date,
+            "event_head_1": evt.event_head_1 or "Unassigned",
+            "event_head_2": evt.event_head_2 or "Unassigned",
+            "status": (
+                evt.status.value
+                if hasattr(evt.status, "value")
+                else evt.status
+            ),
+            "created_at": (
+                evt.created_at.strftime("%Y-%m-%d")
+                if evt.created_at else ""
+            ),
+        })
+
+    return response
+
+@app.post("/events", response_model=EventResponse, status_code=status.HTTP_201_CREATED)
+def create_event(
+    event: EventCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(
+        require_roles(models.UserRole.CORE)
+    ),
+):
+
+    db_event = models.Event(
+        name=event.name,
+        event_date=event.event_date,
+        event_head_1=event.event_head_1,
+        event_head_2=event.event_head_2,
+        status=event.status
+    )
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    
+    return {
+        "id": db_event.id,
+        "name": db_event.name,
+        "event_date": db_event.event_date,
+        "event_head_1": db_event.event_head_1 or "Unassigned",
+        "event_head_2": db_event.event_head_2 or "Unassigned",
+        "status": db_event.status.value if hasattr(db_event.status, 'value') else db_event.status,
+        "created_at": db_event.created_at.strftime("%Y-%m-%d")
+    }
+
+# --- CSV IMPORT ENDPOINT ---
+@app.post("/events/{event_id}/import-csv")
+async def import_participants_csv(
+    event_id: str, 
+    file: UploadFile = File(...), 
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # RBAC: Core and Event Heads can import CSVs
+    require_event_access(event_id, current_user, db)
+
+    if current_user.role not in (
+        models.UserRole.CORE,
+        models.UserRole.EVENT_HEAD,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Core and assigned Event Heads can perform this action",
+        )
+
+    event = db.query(models.Event).filter(models.Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    contents = await file.read()
+    decoded = contents.decode("utf-8", errors="ignore")
+    io_stream = io.StringIO(decoded)
+    reader = csv.DictReader(io_stream)
+    
+    added_count = 0
+    skipped_count = 0
+
+    for row in reader:
+        normalized_row = {k.strip().lower(): v.strip() for k, v in row.items() if k}
+        name = normalized_row.get("name") or normalized_row.get("full name") or normalized_row.get("participant name")
+        email = normalized_row.get("email") or normalized_row.get("email address")
+        phone = normalized_row.get("phone") or normalized_row.get("phone number") or normalized_row.get("mobile")
+
+        if not email or not name:
+            continue
+
+        email = email.lower()
+        name = name.strip()
+
+        existing = db.query(models.Participant).filter(
+            models.Participant.event_id == event_id,
+            models.Participant.email == email,
+            models.Participant.name == name
+        ).first()
+
+        if existing:
+            skipped_count += 1
+            continue
+
+        new_participant = models.Participant(
+            event_id=event_id,
+            name=name,
+            email=email,
+            phone=phone
+        )
+        db.add(new_participant)
+        added_count += 1
+
+    db.commit()
+
+    return {
+        "message": "CSV imported successfully",
+        "added": added_count,
+        "skipped": skipped_count,
+        "total_processed": added_count + skipped_count
+    }
+
+# --- USER MANAGEMENT ENDPOINTS ---
+@app.get(
+    "/users",
+    response_model=List[UserResponse],
+)
+def get_users(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(
+        require_roles(models.UserRole.CORE)
+    ),
+):
+    users = db.query(models.User).order_by(
+        models.User.created_at.desc()
+    ).all()
+
+    return [
+        {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "role": user.role.value,
+            "created_at": (
+                user.created_at.strftime("%Y-%m-%d")
+                if user.created_at else ""
+            ),
+        }
+        for user in users
+    ]
+
+@app.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_user(
+    user: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(
+        require_roles(models.UserRole.CORE)
+    ),
+):
+    # RBAC Rules for User Creation:
+    # 1. Core can create Core or Event Head (and Volunteers).
+    # 2. Event Head can ONLY create Volunteers.
+    # 3. Volunteers cannot create users.
+    
+    target_role = user.role.value if hasattr(user.role, 'value') else user.role
+
+    
+    # Check if email already exists
+    existing_user = db.query(models.User).filter(models.User.email == user.email.lower()).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User with this email already exists.")
+
+    db_user = models.User(
+        name=user.name,
+        email=user.email.lower(),
+        hashed_password=hash_password(user.password),
+        role=user.role
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
+    return {
+        "id": db_user.id,
+        "name": db_user.name,
+        "email": db_user.email,
+        "role": db_user.role.value if hasattr(db_user.role, 'value') else db_user.role,
+        "created_at": db_user.created_at.strftime("%Y-%m-%d")
+    }
+
+
+@app.post("/events/{event_id}/volunteers", status_code=201)
+def assign_volunteer(
+    event_id: str,
+    payload: VolunteerAssignment,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    event = require_event_access(event_id, current_user, db)
+
+    if current_user.role not in (
+        models.UserRole.CORE,
+        models.UserRole.EVENT_HEAD,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Core and assigned Event Heads can assign volunteers",
+        )
+
+    volunteer = db.query(models.User).filter(
+        models.User.id == payload.user_id
+    ).first()
+
+    if volunteer is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if volunteer.role != models.UserRole.VOLUNTEER:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected user is not a Volunteer",
+        )
+
+    existing = db.query(models.EventMembership).filter(
+        models.EventMembership.event_id == event.id,
+        models.EventMembership.user_id == volunteer.id,
+    ).first()
+
+    if existing:
+        return {
+            "message": "Volunteer is already assigned to this event",
+            "event_id": event.id,
+            "user_id": volunteer.id,
+        }
+
+    membership = models.EventMembership(
+        event_id=event.id,
+        user_id=volunteer.id,
+    )
+
+    db.add(membership)
+    db.commit()
+
+    return {
+        "message": "Volunteer assigned successfully",
+        "event_id": event.id,
+        "user_id": volunteer.id,
+    }
+
+
+@app.post("/events/{event_id}/send-passes")
+async def send_event_passes(
+    event_id: str,
+    payload: EmailPassRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # RBAC: Core & Event Heads can send emails
+    require_event_access(event_id, current_user, db)
+
+    if current_user.role not in (
+        models.UserRole.CORE,
+        models.UserRole.EVENT_HEAD,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Core and assigned Event Heads can perform this action",
+        )
+
+    event = db.query(models.Event).filter(models.Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    participants = db.query(models.Participant).filter(models.Participant.event_id == event_id).all()
+    if not participants:
+        return {"message": "No participants found for this event", "sent": 0}
+
+    # Retrieve SMTP credentials from environment variables (or fallback mock mode)
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+
+    sent_count = 0
+    failed_count = 0
+
+    # Real SMTP connection if configured, else simulation log
+    use_real_smtp = bool(smtp_user and smtp_pass)
+
+    server = None
+    if use_real_smtp:
+        try:
+            server = smtplib.SMTP(smtp_host, smtp_port)
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"SMTP Authentication Failed: {str(e)}")
+
+    for participant in participants:
+        # Generate token if not already generated
+        token = participant.qr_token or f"THIRA-{participant.id[:8].upper()}"
+        if not participant.qr_token:
+            participant.qr_token = token
+
+        subject = payload.subject.replace("{event_name}", event.name).replace("{name}", participant.name)
+        html_content = generate_pass_html(
+            participant_name=participant.name,
+            event_name=event.name,
+            event_date=event.event_date,
+            qr_token=token,
+            message=payload.custom_message
+        )
+
+        if use_real_smtp and server:
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = f"Thira Cochin Events <{smtp_user}>"
+                msg["To"] = participant.email
+                msg.attach(MIMEText(html_content, "html"))
+                
+                server.sendmail(smtp_user, participant.email, msg.as_string())
+                sent_count += 1
+            except Exception as err:
+                print(f"Failed to email {participant.email}: {err}")
+                failed_count += 1
+        else:
+            # Simulated send mode for local dev testing
+            sent_count += 1
+
+    if server:
+        server.quit()
+
+    db.commit()
+
+    return {
+        "message": "Email passes processed successfully",
+        "total_participants": len(participants),
+        "sent": sent_count,
+        "failed": failed_count,
+        "mode": "SMTP Live" if use_real_smtp else "Simulated (Configure SMTP_USER & SMTP_PASS in .env for real emails)"
+    }
+
+    
+
+@app.post("/events/{event_id}/check-in")
+def check_in_participant(
+    event_id: str,
+    payload: CheckInRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # RBAC: Volunteers and Event Heads (and Core) can perform gate check-ins
+    require_event_access(event_id, current_user, db)
+
+    token = payload.qr_token.strip()
+    participant = db.query(models.Participant).filter(
+        models.Participant.event_id == event_id,
+        models.Participant.qr_token == token
+    ).first()
+
+    if not participant:
+        raise HTTPException(status_code=404, detail="Invalid QR Pass Token. Participant not found for this event.")
+
+    if participant.checked_in:
+        return {
+            "status": "already_checked_in",
+            "message": f"⚠️ Warning: {participant.name} was already checked in!",
+            "participant": {
+                "name": participant.name,
+                "email": participant.email,
+                "checked_in_at": "Earlier"
+            }
+        }
+
+    # Mark as checked in
+    participant.checked_in = True
+    participant.checked_in_at = datetime.utcnow()
+    participant.checked_in_by_id = current_user.id
+
+    db.commit()
+    db.refresh(participant)
+
+    return {
+        "status": "success",
+        "message": f"✅ Check-in successful for {participant.name}!",
+        "participant": {
+            "name": participant.name,
+            "email": participant.email
+        }
+    }
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    email = str(payload.email).strip().lower()
+
+    user = db.query(models.User).filter(
+        models.User.email == email
+    ).first()
+
+    if not user or not verify_password(
+        user.hashed_password, payload.password
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(user.id)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 1800,
+    }
+
+
+@app.get("/auth/me", response_model=CurrentUserResponse)
+def get_me(
+    current_user: models.User = Depends(get_current_user),
+):
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "email": current_user.email,
+        "role": current_user.role.value,
+    }
