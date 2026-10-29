@@ -624,6 +624,119 @@ def get_users(
         for user in users
     ]
 
+# --- Shared HTML layout for dashboard emails (invitation + announcement) ---
+_ROLE_BADGE = {
+    "Core": ("#0084FF", "#ffffff"),
+    "Event Head": ("#FBBF24", _EMAIL_INK),
+    "Volunteer": ("#047857", "#ffffff"),
+}
+
+
+def _email_logo_html() -> str:
+    logo_url = os.getenv("EMAIL_LOGO_URL", "").strip()
+    if logo_url:
+        return (
+            f'<img src="{html.escape(logo_url, quote=True)}" alt="Thira Cochin" height="72" '
+            f'style="display:block;margin:0 auto 10px;height:72px;width:auto;border:0;" />'
+        )
+    return (
+        f'<div style="font-family:{_EMAIL_FONT};font-size:30px;font-weight:700;'
+        f'color:#ffffff;letter-spacing:0.5px;margin-bottom:6px;">thira-cochin</div>'
+    )
+
+
+def _email_layout(title: str, preheader: str, header_label: str, inner_html: str, footer_text: str) -> str:
+    """Branded shell: red header band, cream paper body, footer. `inner_html` must already be escaped."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light only">
+  <meta name="supported-color-schemes" content="light only">
+  <title>{html.escape(title)}</title>
+</head>
+<body style="margin:0;padding:0;background-color:{_EMAIL_CREAM};">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:{_EMAIL_CREAM};">{html.escape(preheader)}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{_EMAIL_CREAM};">
+    <tr>
+      <td align="center" style="padding:32px 12px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;border-radius:16px;overflow:hidden;border:1px solid {_EMAIL_LINE};">
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_BRAND};padding:28px 24px 24px;">
+              {_email_logo_html()}
+              <div style="font-family:{_EMAIL_FONT};font-size:16px;color:#ffffff;opacity:0.92;">{html.escape(header_label)}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color:{_EMAIL_PAPER};padding:32px 28px;font-family:{_EMAIL_FONT};color:{_EMAIL_INK};">
+              {inner_html}
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_CREAM};border-top:1px solid {_EMAIL_LINE};padding:16px 24px;font-family:{_EMAIL_FONT};font-size:12px;line-height:1.5;color:{_EMAIL_MUTED};">
+              {footer_text}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def generate_invitation_html(recipient_name: str, role: str, invite_url: str) -> str:
+    safe_name = html.escape(recipient_name or "there")
+    safe_role = html.escape(role)
+    safe_url = html.escape(invite_url, quote=True)
+    badge_bg, badge_fg = _ROLE_BADGE.get(role, (_EMAIL_BRAND, "#ffffff"))
+    inner = f"""
+              <div style="font-size:16px;color:{_EMAIL_MUTED};margin-bottom:6px;">Hi {safe_name},</div>
+              <div style="font-size:28px;line-height:1.2;font-weight:700;color:{_EMAIL_INK};margin-bottom:14px;">Join the Thira Dashboard</div>
+              <div style="font-size:16px;line-height:1.6;color:{_EMAIL_INK};margin-bottom:8px;">You have been invited to join as</div>
+              <div style="margin-bottom:22px;"><span style="display:inline-block;background-color:{badge_bg};color:{badge_fg};border-radius:999px;padding:4px 14px;font-size:14px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;">{safe_role}</span></div>
+              <div style="font-size:16px;line-height:1.6;color:{_EMAIL_INK};border-left:4px solid {_EMAIL_BRAND};padding:2px 0 2px 14px;margin-bottom:28px;">Use the secure button below to create your own password. The link expires in 24 hours and can only be used once.</div>
+              <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto 24px;">
+                <tr>
+                  <td align="center" bgcolor="{_EMAIL_BRAND}" style="background-color:{_EMAIL_BRAND};border-radius:10px;">
+                    <a href="{safe_url}" style="display:inline-block;padding:14px 32px;font-family:{_EMAIL_FONT};font-size:18px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:10px;">Set your password</a>
+                  </td>
+                </tr>
+              </table>
+              <div style="font-size:14px;line-height:1.5;color:{_EMAIL_MUTED};margin-bottom:6px;">Button not working? Paste this link into your browser:</div>
+              <div style="font-family:'Courier New',Courier,monospace;font-size:12px;line-height:1.5;color:{_EMAIL_ACCENT};word-break:break-all;background-color:#ffffff;border:1px solid {_EMAIL_LINE};border-radius:8px;padding:10px 12px;margin-bottom:20px;"><a href="{safe_url}" style="color:{_EMAIL_ACCENT};text-decoration:none;">{safe_url}</a></div>
+              <div style="font-size:14px;line-height:1.5;color:{_EMAIL_MUTED};">If you weren't expecting this invitation, you can safely ignore this email.</div>"""
+    return _email_layout(
+        title="Your Thira Dashboard invitation",
+        preheader=f"You have been invited to the Thira Dashboard as {role}. Set your password to get started.",
+        header_label="Dashboard invitation",
+        inner_html=inner,
+        footer_text="Thira Cochin Events",
+    )
+
+
+def generate_announcement_html(participant_name: str, event_name: str, message: str) -> str:
+    safe_name = html.escape(participant_name or "there")
+    safe_event = html.escape(event_name)
+    safe_message = (
+        html.escape(message or "")
+        .replace("\r\n", "\n")
+        .replace("\n", "<br>")
+    )
+    inner = f"""
+              <div style="font-size:16px;color:{_EMAIL_MUTED};margin-bottom:6px;">Hi {safe_name},</div>
+              <div style="font-size:28px;line-height:1.2;font-weight:700;color:{_EMAIL_INK};margin-bottom:20px;">{safe_event}</div>
+              <div style="font-size:17px;line-height:1.65;color:{_EMAIL_INK};border-left:4px solid {_EMAIL_BRAND};padding:2px 0 2px 14px;">{safe_message}</div>"""
+    return _email_layout(
+        title=f"Update from {event_name}",
+        preheader=(message or "").strip().replace("\n", " ")[:110],
+        header_label="Announcement",
+        inner_html=inner,
+        footer_text=f"You are receiving this because you are registered for {safe_event}.",
+    )
+
+
 def _smtp_credentials():
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
@@ -641,17 +754,7 @@ def _send_invitation_email(recipient_name: str, recipient_email: str, role: str,
     smtp_host, smtp_port, smtp_user, smtp_pass = _smtp_credentials()
     frontend_url = os.getenv("FRONTEND_URL", "https://dashboard.thira-cochin.in").strip().rstrip("/")
     invite_url = f"{frontend_url}/?invite={quote(raw_token, safe='')}"
-    safe_name = html.escape(recipient_name or "there")
-    safe_role = html.escape(role)
-    safe_url = html.escape(invite_url, quote=True)
-    body = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;background:#fff4e0;color:#2b1206;padding:24px">
-    <div style="max-width:600px;margin:auto;background:#ffffff;border:1px solid #e6be86;border-radius:12px;padding:28px">
-    <h2 style="color:#c03410;margin-top:0">Welcome to Thira Cochin</h2>
-    <p>Hi {safe_name},</p><p>You have been invited to join the Thira Dashboard as <strong>{safe_role}</strong>.</p>
-    <p>Use the secure link below to create your own password. This link expires in 24 hours and can only be used once.</p>
-    <p style="margin:28px 0"><a href="{safe_url}" style="background:#c03410;color:#ffffff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold">Set your password</a></p>
-    <p>If you weren't expecting this invitation, you can ignore this email.</p>
-    <p style="font-size:12px;color:#66452d">Thira Cochin Events</p></div></body></html>"""
+    body = generate_invitation_html(recipient_name, role, invite_url)
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "Your Thira Dashboard invitation"
     msg["From"] = f"Thira Cochin Events <{smtp_user}>"
@@ -1133,13 +1236,7 @@ def _announcement_smtp_connection():
 
 
 def _send_announcement_message(server, smtp_user, participant, event, subject, message):
-    safe_name = html.escape(participant.name or "there")
-    safe_event = html.escape(event.name)
-    safe_message = html.escape(message).replace("\r\n", "\n").replace("\n", "<br>")
-    body = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;background:#fff4e0;color:#2b1206;padding:24px">
-    <div style="max-width:600px;margin:auto;background:#ffffff;border:1px solid #e6be86;border-radius:12px;padding:24px">
-    <h2 style="color:#c03410">{safe_event}</h2><p>Hi {safe_name},</p><p style="line-height:1.6">{safe_message}</p>
-    <p style="font-size:12px;color:#66452d">Thira Cochin Events</p></div></body></html>"""
+    body = generate_announcement_html(participant.name, event.name, message)
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject.replace("{event_name}", event.name).replace("{name}", participant.name)
     msg["From"] = f"Thira Cochin Events <{smtp_user}>"
