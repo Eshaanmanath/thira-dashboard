@@ -50,53 +50,118 @@ class EmailPassRequest(BaseModel):
     custom_message: Optional[str] = "We are excited to welcome you! Please present the attached QR code token at the entry gate."
 
 # --- Helper function for HTML Email generation ---
+# Brand palette (matches the dashboard)
+_EMAIL_BRAND = "#C03410"
+_EMAIL_ACCENT = "#0062C4"
+_EMAIL_CREAM = "#FFDDAB"
+_EMAIL_PAPER = "#FFF4E0"
+_EMAIL_LINE = "#E6BE86"
+_EMAIL_INK = "#2B1206"
+_EMAIL_MUTED = "#66452D"
+_EMAIL_FONT = "'Source Serif 4', Georgia, 'Times New Roman', serif"
+
+
 def generate_pass_html(participant_name: str, event_name: str, event_date: str, qr_token: str, message: str) -> str:
     # Uses QuickChart API to render a live embedded QR code image from the unique QR token
     safe_qr_token = quote(qr_token, safe="")
-    qr_image_url = f"https://quickchart.io/qr?text={safe_qr_token}&size=200&margin=2"
+    qr_image_url = f"https://quickchart.io/qr?text={safe_qr_token}&size=360&margin=1"
+    safe_name = html.escape(participant_name or "there")
     safe_event_name = html.escape(event_name)
     safe_event_date = html.escape(event_date)
     safe_qr_token_text = html.escape(qr_token)
-    safe_message = html.escape(message or "").replace("\\n", "<br>")
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 20px; }}
-            .card {{ max-width: 480px; margin: 0 auto; background-color: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; text-align: center; }}
-            .brand {{ color: #818cf8; font-size: 20px; font-weight: bold; margin-bottom: 8px; }}
-            .title {{ font-size: 22px; font-weight: bold; color: #ffffff; margin-bottom: 4px; }}
-            .date {{ color: #94a3b8; font-size: 14px; margin-bottom: 20px; }}
-            .msg {{ font-size: 14px; color: #cbd5e1; line-height: 1.5; text-align: left; background: #0f172a; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; }}
-            .qr-box {{ background: #ffffff; padding: 16px; border-radius: 12px; display: inline-block; margin-bottom: 12px; }}
-            .token {{ font-family: monospace; font-size: 16px; letter-spacing: 2px; color: #818cf8; font-weight: bold; }}
-            .footer {{ font-size: 11px; color: #64748b; margin-top: 24px; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <div class="brand">thira-cochin</div>
-            <div class="title">{safe_event_name}</div>
-            <div class="date">📅 {safe_event_date}</div>
-            
-            <p class="msg">{safe_message}</p>
-            
-            <div class="qr-box">
-                <img src="{qr_image_url}" alt="Entry QR Code" width="180" height="180" />
-            </div>
-            
-            <div class="token">PASS TOKEN: {safe_qr_token_text}</div>
-            <p style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Show this QR code or token to volunteers at gate entry.</p>
-            
-            <div class="footer">
-                This is an automated pass issued by dashboard.thira-cochin.in
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    safe_message = (
+        html.escape(message or "")
+        .replace("\r\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\n", "<br>")
+    )
+
+    # Optional: a PNG of the logo (white on transparent) hosted somewhere public.
+    # Email clients such as Gmail do not render SVG, so set EMAIL_LOGO_URL in .env.
+    logo_url = os.getenv("EMAIL_LOGO_URL", "").strip()
+    if logo_url:
+        logo_html = (
+            f'<img src="{html.escape(logo_url, quote=True)}" alt="Thira Cochin" height="72" '
+            f'style="display:block;margin:0 auto 10px;height:72px;width:auto;border:0;" />'
+        )
+    else:
+        logo_html = (
+            f'<div style="font-family:{_EMAIL_FONT};font-size:30px;font-weight:700;'
+            f'color:#ffffff;letter-spacing:0.5px;margin-bottom:6px;">thira-cochin</div>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light only">
+  <meta name="supported-color-schemes" content="light only">
+  <title>Your entry pass for {safe_event_name}</title>
+</head>
+<body style="margin:0;padding:0;background-color:{_EMAIL_CREAM};">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:{_EMAIL_CREAM};">
+    Your entry pass for {safe_event_name}. Show the QR code at the gate.
+  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{_EMAIL_CREAM};">
+    <tr>
+      <td align="center" style="padding:32px 12px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;border-radius:16px;overflow:hidden;border:1px solid {_EMAIL_LINE};">
+
+          <!-- Brand header -->
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_BRAND};padding:28px 24px 24px;">
+              {logo_html}
+              <div style="font-family:{_EMAIL_FONT};font-size:16px;color:#ffffff;opacity:0.92;">Entry pass</div>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="background-color:{_EMAIL_PAPER};padding:32px 28px 8px;font-family:{_EMAIL_FONT};color:{_EMAIL_INK};">
+              <div style="font-size:16px;color:{_EMAIL_MUTED};margin-bottom:6px;">Hi {safe_name},</div>
+              <div style="font-size:28px;line-height:1.2;font-weight:700;color:{_EMAIL_INK};margin-bottom:6px;">{safe_event_name}</div>
+              <div style="font-size:16px;font-weight:600;color:{_EMAIL_BRAND};margin-bottom:20px;">{safe_event_date}</div>
+              <div style="font-size:16px;line-height:1.6;color:{_EMAIL_INK};border-left:4px solid {_EMAIL_BRAND};padding:2px 0 2px 14px;margin-bottom:28px;">{safe_message}</div>
+            </td>
+          </tr>
+
+          <!-- QR code -->
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_PAPER};padding:0 28px 8px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background-color:#ffffff;border:2px solid {_EMAIL_BRAND};border-radius:16px;">
+                <tr>
+                  <td style="padding:16px;">
+                    <img src="{qr_image_url}" alt="Entry QR code" width="200" height="200" style="display:block;width:200px;height:200px;border:0;" />
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Token -->
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_PAPER};padding:16px 28px 32px;font-family:{_EMAIL_FONT};">
+              <div style="font-size:14px;color:{_EMAIL_MUTED};margin-bottom:8px;">Pass token</div>
+              <div style="display:inline-block;background-color:#ffffff;border:1px solid {_EMAIL_LINE};border-radius:8px;padding:8px 14px;font-family:'Courier New',Courier,monospace;font-size:16px;font-weight:700;letter-spacing:1.5px;color:{_EMAIL_ACCENT};">{safe_qr_token_text}</div>
+              <div style="font-size:14px;line-height:1.5;color:{_EMAIL_MUTED};margin-top:14px;">Show this QR code or token to a volunteer at the gate.</div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td align="center" style="background-color:{_EMAIL_CREAM};border-top:1px solid {_EMAIL_LINE};padding:16px 24px;font-family:{_EMAIL_FONT};font-size:12px;line-height:1.5;color:{_EMAIL_MUTED};">
+              This pass was issued automatically by dashboard.thira-cochin.in.
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
