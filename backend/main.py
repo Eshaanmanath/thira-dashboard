@@ -729,6 +729,159 @@ async def send_event_passes(
 
     
 
+@app.get("/events/{event_id}/participants")
+def list_event_participants(
+    event_id: str,
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List participants for an event, optionally searching name/email.
+
+    All roles may read the list only when they have access to this event.
+    QR tokens are intentionally excluded from this response.
+    """
+    require_event_access(event_id, current_user, db)
+
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset cannot be negative")
+
+    query = db.query(models.Participant).filter(
+        models.Participant.event_id == event_id
+    )
+
+    search_term = (q or "").strip()
+    if search_term:
+        pattern = f"%{search_term}%"
+        query = query.filter(
+            or_(
+                models.Participant.name.ilike(pattern),
+                models.Participant.email.ilike(pattern),
+            )
+        )
+
+    total = query.count()
+    participants = query.order_by(
+        models.Participant.name.asc(), models.Participant.id.asc()
+    ).offset(offset).limit(limit).all()
+
+    return {
+        "event_id": event_id,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "participants": [
+            {
+                "id": participant.id,
+                "name": participant.name,
+                "email": participant.email,
+                "phone": participant.phone,
+                "checked_in": bool(participant.checked_in),
+                "checked_in_at": (
+                    participant.checked_in_at.isoformat()
+                    if participant.checked_in_at else None
+                ),
+            }
+            for participant in participants
+        ],
+    }
+
+
+@app.get("/events/{event_id}/stats")
+def get_event_stats(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return current registration and attendance counts for an authorized event."""
+    require_event_access(event_id, current_user, db)
+
+    registered_count = db.query(models.Participant).filter(
+        models.Participant.event_id == event_id
+    ).count()
+    checked_in_count = db.query(models.Participant).filter(
+        models.Participant.event_id == event_id,
+        models.Participant.checked_in.is_(True),
+    ).count()
+
+    return {
+        "event_id": event_id,
+        "registered_count": registered_count,
+        "checked_in_count": checked_in_count,
+        "not_checked_in_count": registered_count - checked_in_count,
+    }
+
+
+@app.post("/events/{event_id}/participants/{participant_id}/manual-check-in")
+def manual_check_in_participant(
+    event_id: str,
+    participant_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Check in a selected participant without requiring their QR token."""
+    require_event_access(event_id, current_user, db)
+
+    participant = db.query(models.Participant).filter(
+        models.Participant.id == participant_id,
+        models.Participant.event_id == event_id,
+    ).first()
+    if participant is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Participant not found for this event",
+        )
+
+    # Match the QR flow's conditional update so concurrent check-ins cannot
+    # record the same participant twice.
+    checked_in_at = datetime.utcnow()
+    result = db.query(models.Participant).filter(
+        models.Participant.id == participant_id,
+        models.Participant.event_id == event_id,
+        or_(
+            models.Participant.checked_in.is_(False),
+            models.Participant.checked_in.is_(None),
+        ),
+    ).update(
+        {
+            models.Participant.checked_in: True,
+            models.Participant.checked_in_at: checked_in_at,
+            models.Participant.checked_in_by_id: current_user.id,
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(participant)
+
+    participant_details = {
+        "id": participant.id,
+        "name": participant.name,
+        "email": participant.email,
+        "checked_in": bool(participant.checked_in),
+        "checked_in_at": (
+            participant.checked_in_at.isoformat()
+            if participant.checked_in_at else None
+        ),
+    }
+
+    if result == 0:
+        return {
+            "status": "already_checked_in",
+            "message": f"{participant.name} was already checked in.",
+            "participant": participant_details,
+        }
+
+    return {
+        "status": "success",
+        "message": f"Manual check-in successful for {participant.name}.",
+        "participant": participant_details,
+    }
+
+
 @app.post("/events/{event_id}/verify-pass")
 def verify_participant_pass(
     event_id: str,

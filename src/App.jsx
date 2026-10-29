@@ -11,7 +11,11 @@ import {
   Loader2,
   ShieldAlert,
   FileSpreadsheet,
-  X
+  X,
+  Search,
+  CheckCircle2,
+  RefreshCw,
+  UserCheck
 } from 'lucide-react';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
@@ -49,6 +53,18 @@ export default function Dashboard() {
   const [loadingEvents, setLoadingEvents] = useState(true);
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [error, setError] = useState(null);
+
+  // Participant workspace data
+  const [participants, setParticipants] = useState([]);
+  const [participantsTotal, setParticipantsTotal] = useState(0);
+  const [participantSearch, setParticipantSearch] = useState('');
+  const [loadingParticipants, setLoadingParticipants] = useState(false);
+  const [participantError, setParticipantError] = useState('');
+  const [eventStats, setEventStats] = useState(null);
+  const [loadingStats, setLoadingStats] = useState(false);
+  const [manualConfirmParticipant, setManualConfirmParticipant] = useState(null);
+  const [manualCheckingIn, setManualCheckingIn] = useState(false);
+  const [manualCheckInMessage, setManualCheckInMessage] = useState('');
 
   useEffect(() => {
     const onUnauthorized = () => {
@@ -162,6 +178,82 @@ export default function Dashboard() {
     }
   };
 
+  const fetchParticipants = async (eventId = selectedEvent?.id, search = participantSearch) => {
+    if (!eventId) return;
+    try {
+      setLoadingParticipants(true);
+      setParticipantError('');
+      const params = new URLSearchParams({ limit: '100', offset: '0' });
+      if (search.trim()) params.set('q', search.trim());
+      const res = await apiFetch(`${API_BASE}/events/${eventId}/participants?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load participants');
+      setParticipants(Array.isArray(data.participants) ? data.participants : []);
+      setParticipantsTotal(Number(data.total ?? 0));
+    } catch (err) {
+      setParticipantError(err.message || 'Could not load participants');
+    } finally {
+      setLoadingParticipants(false);
+    }
+  };
+
+  const fetchEventStats = async (eventId = selectedEvent?.id) => {
+    if (!eventId) return;
+    try {
+      setLoadingStats(true);
+      const res = await apiFetch(`${API_BASE}/events/${eventId}/stats`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load event statistics');
+      setEventStats(data);
+    } catch (err) {
+      console.error('Could not load event statistics:', err);
+    } finally {
+      setLoadingStats(false);
+    }
+  };
+
+  const refreshParticipantWorkspace = async () => {
+    if (!selectedEvent) return;
+    await Promise.all([
+      fetchParticipants(selectedEvent.id, participantSearch),
+      fetchEventStats(selectedEvent.id),
+    ]);
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'event-detail' || !selectedEvent) return;
+    const timer = setTimeout(() => {
+      fetchParticipants(selectedEvent.id, participantSearch);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [activeTab, selectedEvent?.id, participantSearch]);
+
+  useEffect(() => {
+    if (activeTab !== 'event-detail' || !selectedEvent) return;
+    fetchEventStats(selectedEvent.id);
+  }, [activeTab, selectedEvent?.id]);
+
+  const handleManualCheckIn = async () => {
+    if (!selectedEvent || !manualConfirmParticipant || manualCheckingIn) return;
+    try {
+      setManualCheckingIn(true);
+      setManualCheckInMessage('');
+      const res = await apiFetch(
+        `${API_BASE}/events/${selectedEvent.id}/participants/${manualConfirmParticipant.id}/manual-check-in`,
+        { method: 'POST' }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Manual check-in failed');
+      setManualCheckInMessage(data.message || (data.status === 'success' ? 'Check-in successful.' : 'Participant was already checked in.'));
+      setManualConfirmParticipant(null);
+      await refreshParticipantWorkspace();
+    } catch (err) {
+      setManualCheckInMessage(err.message || 'Manual check-in failed');
+    } finally {
+      setManualCheckingIn(false);
+    }
+  };
+
   // Modal State for CSV Import (Drag and Drop)
   const [showCsvModal, setShowCsvModal] = useState(false);
   const [selectedCsvFile, setSelectedCsvFile] = useState(null);
@@ -210,7 +302,8 @@ export default function Dashboard() {
         throw new Error(err.detail || "Failed to upload CSV");
       }
       const result = await res.json();
-      alert(`CSV Import Successful!\n- Added: ${result.added} new participants\n- Skipped: ${result.skipped} duplicate(s)`);
+      alert(`CSV Import Successful!\n- Added: ${result.added} new participants\n- Skipped: ${result.skipped} row(s)`);
+      await refreshParticipantWorkspace();
       setShowCsvModal(false);
       setSelectedCsvFile(null);
     } catch (err) {
@@ -407,6 +500,7 @@ export default function Dashboard() {
       if (!res.ok) throw new Error(data.detail || 'Check-in failed');
 
       setCheckInResult(data);
+      await refreshParticipantWorkspace();
       setCheckInToken('');
       setCheckInPreview(null);
       if (data.status === 'success') {
@@ -621,7 +715,7 @@ export default function Dashboard() {
                         <td className="p-4 text-slate-300 text-xs">{evt.event_head_2}</td>
                         <td className="p-4 text-right">
                           <button
-                            onClick={() => { setSelectedEvent(evt); setActiveTab('event-detail'); }}
+                            onClick={() => { setSelectedEvent(evt); setParticipantSearch(''); setParticipants([]); setEventStats(null); setManualCheckInMessage(''); setActiveTab('event-detail'); }}
                             className="inline-flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 font-medium"
                           >
                             Open Workspace <ArrowRight className="w-3.5 h-3.5" />
@@ -731,6 +825,104 @@ export default function Dashboard() {
               </span>
             </div>
 
+            {/* Attendance metrics */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Registered Participants</p>
+                <p className="text-3xl font-bold text-white">{loadingStats ? '—' : (eventStats?.registered_count ?? '—')}</p>
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Checked In</p>
+                <p className="text-3xl font-bold text-emerald-400">{loadingStats ? '—' : (eventStats?.checked_in_count ?? '—')}</p>
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Not Yet Checked In</p>
+                <p className="text-3xl font-bold text-amber-300">{loadingStats ? '—' : (eventStats?.not_checked_in_count ?? '—')}</p>
+              </div>
+            </div>
+
+            {/* Participant directory and manual check-in */}
+            <section className="bg-slate-950 border border-slate-800 rounded-xl p-5 mb-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                <div>
+                  <h3 className="text-lg font-semibold text-white">Participants</h3>
+                  <p className="text-xs text-slate-400 mt-1">Search by name or email. Manual check-in is available if a QR pass cannot be scanned.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={refreshParticipantWorkspace}
+                  disabled={loadingParticipants || loadingStats}
+                  className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-700 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${(loadingParticipants || loadingStats) ? 'animate-spin' : ''}`} /> Refresh
+                </button>
+              </div>
+              <div className="relative mb-4">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                <input
+                  type="search"
+                  value={participantSearch}
+                  onChange={(e) => setParticipantSearch(e.target.value)}
+                  placeholder="Search participants by name or email..."
+                  className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+              {manualCheckInMessage && (
+                <div className="flex items-start justify-between gap-3 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 mb-4 text-sm text-slate-200">
+                  <span>{manualCheckInMessage}</span>
+                  <button type="button" onClick={() => setManualCheckInMessage('')} aria-label="Dismiss message" className="text-slate-400 hover:text-white"><X className="w-4 h-4" /></button>
+                </div>
+              )}
+              {participantError ? (
+                <div className="text-sm text-red-300 bg-red-950/30 border border-red-900 rounded-lg p-3">{participantError}</div>
+              ) : loadingParticipants ? (
+                <div className="flex items-center justify-center gap-2 py-10 text-sm text-slate-400"><Loader2 className="w-4 h-4 animate-spin" /> Loading participants...</div>
+              ) : participants.length === 0 ? (
+                <div className="text-center py-10 text-sm text-slate-500">{participantSearch ? 'No participants match your search.' : 'No participants have been added to this event yet.'}</div>
+              ) : (
+                <>
+                  <div className="text-xs text-slate-500 mb-2">Showing {participants.length} of {participantsTotal} participant{participantsTotal === 1 ? '' : 's'}{participantsTotal > participants.length ? ' (first 100)' : ''}</div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left min-w-[650px]">
+                      <thead><tr className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500">
+                        <th className="py-3 px-2 font-semibold">Participant</th>
+                        <th className="py-3 px-2 font-semibold">Phone</th>
+                        <th className="py-3 px-2 font-semibold">Attendance</th>
+                        <th className="py-3 px-2 font-semibold">Checked In At</th>
+                        <th className="py-3 px-2 text-right font-semibold">Action</th>
+                      </tr></thead>
+                      <tbody>
+                        {participants.map((participant) => (
+                          <tr key={participant.id} className="border-b border-slate-900 last:border-0 hover:bg-slate-900/60">
+                            <td className="py-3 px-2">
+                              <p className="text-sm font-medium text-white">{participant.name}</p>
+                              <p className="text-xs text-slate-500 break-all">{participant.email}</p>
+                            </td>
+                            <td className="py-3 px-2 text-xs text-slate-400">{participant.phone || '—'}</td>
+                            <td className="py-3 px-2">
+                              <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-semibold ${participant.checked_in ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' : 'bg-amber-950 text-amber-300 border border-amber-800'}`}>
+                                {participant.checked_in ? <><CheckCircle2 className="w-3 h-3" /> Checked in</> : 'Not checked in'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-2 text-xs text-slate-400">{participant.checked_in_at ? new Date(participant.checked_in_at).toLocaleString() : '—'}</td>
+                            <td className="py-3 px-2 text-right">
+                              {participant.checked_in ? (
+                                <span className="text-[10px] text-slate-500">Already checked in</span>
+                              ) : (
+                                <button type="button" onClick={() => { setManualConfirmParticipant(participant); setManualCheckInMessage(''); }} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 px-3 py-2 text-xs font-semibold text-white">
+                                  <UserCheck className="w-3.5 h-3.5" /> Manual check-in
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </section>
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               {/* 1. CSV Import Card */}
               <div className="bg-slate-950 border border-slate-800 p-6 rounded-xl flex flex-col justify-between">
@@ -808,6 +1000,33 @@ export default function Dashboard() {
           </div>
         )}
       </main>
+
+      {/* MODAL: CONFIRM MANUAL CHECK-IN */}
+      {manualConfirmParticipant && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[70]">
+          <div className="bg-slate-950 border border-slate-800 w-full max-w-md rounded-2xl p-6 shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 rounded-lg bg-emerald-900/50 text-emerald-400"><UserCheck className="w-5 h-5" /></div>
+              <div><h3 className="text-lg font-bold text-white">Confirm manual check-in</h3><p className="text-xs text-slate-400">Verify the participant before recording attendance.</p></div>
+            </div>
+            {manualCheckInMessage && (
+              <div className="rounded-lg border border-red-900 bg-red-950/40 p-3 mb-4 text-sm text-red-200">{manualCheckInMessage}</div>
+            )}
+            <div className="rounded-xl border border-slate-800 bg-slate-900 p-4 mb-5">
+              <p className="font-semibold text-white">{manualConfirmParticipant.name}</p>
+              <p className="text-sm text-slate-400 break-all">{manualConfirmParticipant.email}</p>
+              {manualConfirmParticipant.phone && <p className="text-xs text-slate-500 mt-1">{manualConfirmParticipant.phone}</p>}
+            </div>
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={() => setManualConfirmParticipant(null)} disabled={manualCheckingIn} className="px-4 py-2 rounded-lg text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-50">Cancel</button>
+              <button type="button" onClick={handleManualCheckIn} disabled={manualCheckingIn} className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white disabled:opacity-50">
+                {manualCheckingIn && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                Confirm check-in
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* MODAL: CREATE EVENT */}
       {showCreateModal && (
