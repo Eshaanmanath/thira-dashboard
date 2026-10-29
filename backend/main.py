@@ -187,7 +187,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://dashboard.thira-cochin.in"],
+    allow_origins=["http://localhost:5173", "https://dashboard.thira-cochin.in", "https://thira-dashboard.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
