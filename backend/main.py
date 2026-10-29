@@ -12,14 +12,15 @@ import models
 import hashlib
 import html
 import re
+import secrets
 import binascii
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
-from sqlalchemy import or_, update
+from sqlalchemy import and_, or_, update
 from security import (
     create_access_token,
     get_current_user,
@@ -48,6 +49,13 @@ def verify_password(stored_password: str, provided_password: str) -> bool:
 class EmailPassRequest(BaseModel):
     subject: str = "Your Entry Pass for {event_name}"
     custom_message: Optional[str] = "We are excited to welcome you! Please present the attached QR code token at the entry gate."
+
+
+class AnnouncementRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=255)
+    message: str = Field(..., min_length=1, max_length=10000)
+    recipient_filter: str = Field(default="all", pattern="^(all|checked_in|not_checked_in)$")
+
 
 # --- Helper function for HTML Email generation ---
 # Brand palette (matches the dashboard)
@@ -211,10 +219,13 @@ class EventResponse(BaseModel):
         from_attributes = True
 
 class UserCreate(BaseModel):
-    name: str
-    email: str
-    password: str
-    role: models.UserRole  # "Core", "Event Head", or "Volunteer"
+    name: str = Field(..., min_length=1, max_length=255)
+    email: EmailStr
+    role: models.UserRole  # Account is activated by a single-use email invitation
+
+class InvitationCompleteRequest(BaseModel):
+    token: str = Field(..., min_length=32, max_length=256)
+    password: str = Field(..., min_length=10, max_length=128)
 
 class UserResponse(BaseModel):
     id: str
@@ -222,6 +233,9 @@ class UserResponse(BaseModel):
     email: str
     role: str
     created_at: str
+    is_active: bool = True
+    invitation_pending: bool = False
+    invitation_sent: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -604,9 +618,69 @@ def get_users(
                 user.created_at.strftime("%Y-%m-%d")
                 if user.created_at else ""
             ),
+            "is_active": bool(user.is_active),
+            "invitation_pending": not bool(user.is_active),
         }
         for user in users
     ]
+
+def _smtp_credentials():
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    if not (smtp_user and smtp_pass):
+        raise HTTPException(
+            status_code=503,
+            detail="Invitation email is unavailable because SMTP_USER and SMTP_PASS are not configured.",
+        )
+    return smtp_host, smtp_port, smtp_user, smtp_pass
+
+
+def _send_invitation_email(recipient_name: str, recipient_email: str, role: str, raw_token: str):
+    smtp_host, smtp_port, smtp_user, smtp_pass = _smtp_credentials()
+    frontend_url = os.getenv("FRONTEND_URL", "https://dashboard.thira-cochin.in").strip().rstrip("/")
+    invite_url = f"{frontend_url}/?invite={quote(raw_token, safe='')}"
+    safe_name = html.escape(recipient_name or "there")
+    safe_role = html.escape(role)
+    safe_url = html.escape(invite_url, quote=True)
+    body = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;background:#fff4e0;color:#2b1206;padding:24px">
+    <div style="max-width:600px;margin:auto;background:#ffffff;border:1px solid #e6be86;border-radius:12px;padding:28px">
+    <h2 style="color:#c03410;margin-top:0">Welcome to Thira Cochin</h2>
+    <p>Hi {safe_name},</p><p>You have been invited to join the Thira Dashboard as <strong>{safe_role}</strong>.</p>
+    <p>Use the secure link below to create your own password. This link expires in 24 hours and can only be used once.</p>
+    <p style="margin:28px 0"><a href="{safe_url}" style="background:#c03410;color:#ffffff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold">Set your password</a></p>
+    <p>If you weren't expecting this invitation, you can ignore this email.</p>
+    <p style="font-size:12px;color:#66452d">Thira Cochin Events</p></div></body></html>"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Your Thira Dashboard invitation"
+    msg["From"] = f"Thira Cochin Events <{smtp_user}>"
+    msg["To"] = recipient_email
+    msg.attach(MIMEText(
+        f"Hi {recipient_name}, you have been invited to Thira Dashboard as {role}. Set your password using this link (expires in 24 hours): {invite_url}",
+        "plain", "utf-8"
+    ))
+    msg.attach(MIMEText(body, "html", "utf-8"))
+    server = None
+    try:
+        server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+        server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_user, recipient_email, msg.as_string())
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+
+def _new_invitation_token():
+    raw_token = secrets.token_urlsafe(36)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    return raw_token, token_hash, expires_at
+
 
 @app.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def create_user(
@@ -614,39 +688,106 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    # RBAC Rules for User Creation:
-    # 1. Core can create Core or Event Head (and Volunteers).
-    # 2. Event Head can ONLY create Volunteers.
-    # 3. Volunteers cannot create users.
-    
-    target_role = user.role.value if hasattr(user.role, 'value') else user.role
+    # Core can create any role; Event Heads can create Volunteers only.
     if current_user.role == models.UserRole.EVENT_HEAD and user.role != models.UserRole.VOLUNTEER:
         raise HTTPException(status_code=403, detail="Event Heads can create Volunteer accounts only")
     if current_user.role == models.UserRole.VOLUNTEER:
         raise HTTPException(status_code=403, detail="Volunteers cannot create users")
 
-    # Check if email already exists
-    existing_user = db.query(models.User).filter(models.User.email == user.email.lower()).first()
-    if existing_user:
+    # Fail before creating a pending account if invitation email cannot be sent.
+    _smtp_credentials()
+    email = str(user.email).strip().lower()
+    if db.query(models.User).filter(models.User.email == email).first():
         raise HTTPException(status_code=400, detail="User with this email already exists.")
 
+    raw_token, token_hash, expires_at = _new_invitation_token()
+    # Store a random unusable password hash until the invite is completed.
     db_user = models.User(
-        name=user.name,
-        email=user.email.lower(),
-        hashed_password=hash_password(user.password),
-        role=user.role
+        name=user.name.strip(),
+        email=email,
+        hashed_password=hash_password(secrets.token_urlsafe(48)),
+        role=user.role,
+        is_active=False,
+        invitation_token_hash=token_hash,
+        invitation_expires_at=expires_at,
     )
     db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
+    try:
+        db.commit()
+        db.refresh(db_user)
+    except Exception:
+        db.rollback()
+        raise
+
+    try:
+        _send_invitation_email(db_user.name, db_user.email, db_user.role.value, raw_token)
+    except Exception as exc:
+        # Keep the account pending so Core can resend the invitation without recreating it.
+        print(f"Invitation email failed for {db_user.email}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Account was created but the invitation email could not be sent. Use Resend invitation. ({type(exc).__name__})",
+        )
 
     return {
         "id": db_user.id,
         "name": db_user.name,
         "email": db_user.email,
-        "role": db_user.role.value if hasattr(db_user.role, 'value') else db_user.role,
-        "created_at": db_user.created_at.strftime("%Y-%m-%d")
+        "role": db_user.role.value,
+        "created_at": db_user.created_at.strftime("%Y-%m-%d") if db_user.created_at else "",
+        "is_active": db_user.is_active,
+        "invitation_pending": True,
+        "invitation_sent": True,
     }
+
+
+@app.post("/users/{user_id}/resend-invitation")
+def resend_user_invitation(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="You do not have permission to resend invitations")
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if current_user.role == models.UserRole.EVENT_HEAD and target.role != models.UserRole.VOLUNTEER:
+        raise HTTPException(status_code=403, detail="Event Heads can resend invitations for Volunteer accounts only")
+    if target.is_active:
+        raise HTTPException(status_code=400, detail="This user has already activated their account")
+    _smtp_credentials()
+    raw_token, token_hash, expires_at = _new_invitation_token()
+    target.invitation_token_hash = token_hash
+    target.invitation_expires_at = expires_at
+    db.commit()
+    try:
+        _send_invitation_email(target.name, target.email, target.role.value, raw_token)
+    except Exception as exc:
+        print(f"Invitation resend failed for {target.email}: {exc}")
+        raise HTTPException(status_code=502, detail=f"Could not send invitation email ({type(exc).__name__})")
+    return {"message": f"Invitation email sent to {target.email}", "user_id": target.id}
+
+
+@app.post("/auth/complete-invitation")
+def complete_invitation(
+    payload: InvitationCompleteRequest,
+    db: Session = Depends(get_db),
+):
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    user = db.query(models.User).filter(
+        models.User.invitation_token_hash == token_hash,
+        models.User.is_active.is_(False),
+    ).first()
+    now = datetime.utcnow()
+    if user is None or user.invitation_expires_at is None or user.invitation_expires_at < now:
+        raise HTTPException(status_code=400, detail="This invitation link is invalid, expired, or already used. Ask an administrator to resend it.")
+    user.hashed_password = hash_password(payload.password)
+    user.is_active = True
+    user.invitation_token_hash = None
+    user.invitation_expires_at = None
+    db.commit()
+    return {"message": "Password set successfully. You can now sign in."}
 
 
 @app.post("/events/{event_id}/volunteers", status_code=201)
@@ -796,7 +937,11 @@ async def send_event_passes(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # RBAC: Core & Event Heads can send emails
+    """
+    Send QR passes only to participants whose pass email has not already
+    been successfully sent. Failed attempts can be retried. A stale "sending"
+    claim is recoverable after 15 minutes if a process crashes.
+    """
     require_event_access(event_id, current_user, db)
 
     if current_user.role not in (
@@ -812,77 +957,332 @@ async def send_event_passes(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    participants = db.query(models.Participant).filter(models.Participant.event_id == event_id).all()
+    participants = (
+        db.query(models.Participant)
+        .filter(models.Participant.event_id == event_id)
+        .order_by(models.Participant.name.asc(), models.Participant.id.asc())
+        .all()
+    )
     if not participants:
-        return {"message": "No participants found for this event", "sent": 0}
+        return {
+            "message": "No participants found for this event",
+            "total_participants": 0,
+            "sent": 0,
+            "skipped": 0,
+            "failed": 0,
+            "mode": "No participants",
+        }
 
-    # Retrieve SMTP credentials from environment variables (or fallback mock mode)
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
     smtp_user = os.getenv("SMTP_USER", "")
     smtp_pass = os.getenv("SMTP_PASS", "")
-
-    sent_count = 0
-    failed_count = 0
-
-    # Real SMTP connection if configured, else simulation log
     use_real_smtp = bool(smtp_user and smtp_pass)
 
     server = None
     if use_real_smtp:
         try:
-            server = smtplib.SMTP(smtp_host, smtp_port)
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
             server.starttls()
             server.login(smtp_user, smtp_pass)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"SMTP Authentication Failed: {str(e)}")
+        except Exception as exc:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"SMTP Authentication Failed: {str(exc)}",
+            )
 
-    for participant in participants:
-        # Generate token if not already generated
-        token = participant.qr_token or f"THIRA-{participant.id[:8].upper()}"
-        if not participant.qr_token:
-            participant.qr_token = token
+    sent_count = 0
+    skipped_count = 0
+    failed_count = 0
+    simulated_count = 0
+    now = datetime.utcnow()
+    stale_claim_before = now - timedelta(minutes=15)
 
-        subject = payload.subject.replace("{event_name}", event.name).replace("{name}", participant.name)
-        html_content = generate_pass_html(
-            participant_name=participant.name,
-            event_name=event.name,
-            event_date=event.event_date,
-            qr_token=token,
-            message=payload.custom_message
-        )
+    try:
+        for participant in participants:
+            # Persist a stable token before attempting the email.
+            if not participant.qr_token:
+                participant.qr_token = f"THIRA-{participant.id[:8].upper()}"
+                db.commit()
 
-        if use_real_smtp and server:
+            # Atomic claim: concurrent requests cannot claim the same participant.
+            # A stale claim is recoverable if a worker crashed during sending.
+            claim = (
+                db.query(models.Participant)
+                .filter(
+                    models.Participant.id == participant.id,
+                    models.Participant.event_id == event_id,
+                    or_(
+                        models.Participant.qr_email_status.in_(["not_sent", "failed"]),
+                        and_(
+                            models.Participant.qr_email_status == "sending",
+                            models.Participant.qr_email_attempted_at < stale_claim_before,
+                        ),
+                    ),
+                )
+                .update(
+                    {
+                        models.Participant.qr_email_status: "sending",
+                        models.Participant.qr_email_attempted_at: now,
+                        models.Participant.qr_email_last_error: None,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+
+            if claim == 0:
+                skipped_count += 1
+                continue
+
+            # Development mode must not permanently mark a real email as sent.
+            if not use_real_smtp or not server:
+                db.query(models.Participant).filter(
+                    models.Participant.id == participant.id
+                ).update(
+                    {
+                        models.Participant.qr_email_status: "not_sent",
+                        models.Participant.qr_email_last_error: None,
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
+                simulated_count += 1
+                continue
+
+            subject = (
+                payload.subject
+                .replace("{event_name}", event.name)
+                .replace("{name}", participant.name)
+            )
+            html_content = generate_pass_html(
+                participant_name=participant.name,
+                event_name=event.name,
+                event_date=event.event_date,
+                qr_token=participant.qr_token,
+                message=payload.custom_message,
+            )
+
             try:
                 msg = MIMEMultipart("alternative")
                 msg["Subject"] = subject
                 msg["From"] = f"Thira Cochin Events <{smtp_user}>"
                 msg["To"] = participant.email
                 msg.attach(MIMEText(html_content, "html"))
-                
                 server.sendmail(smtp_user, participant.email, msg.as_string())
+
+                db.query(models.Participant).filter(
+                    models.Participant.id == participant.id
+                ).update(
+                    {
+                        models.Participant.qr_email_status: "sent",
+                        models.Participant.qr_email_sent_at: datetime.utcnow(),
+                        models.Participant.qr_email_last_error: None,
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
                 sent_count += 1
-            except Exception as err:
-                print(f"Failed to email {participant.email}: {err}")
+            except Exception as exc:
+                db.query(models.Participant).filter(
+                    models.Participant.id == participant.id
+                ).update(
+                    {
+                        models.Participant.qr_email_status: "failed",
+                        models.Participant.qr_email_last_error: str(exc)[:1000],
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
+                print(f"Failed to email {participant.email}: {exc}")
                 failed_count += 1
-        else:
-            # Simulated send mode for local dev testing
-            sent_count += 1
-
-    if server:
-        server.quit()
-
-    db.commit()
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
 
     return {
-        "message": "Email passes processed successfully",
+        "message": "QR pass email processing completed",
         "total_participants": len(participants),
         "sent": sent_count,
+        "skipped": skipped_count,
         "failed": failed_count,
-        "mode": "SMTP Live" if use_real_smtp else "Simulated (Configure SMTP_USER & SMTP_PASS in .env for real emails)"
+        "simulated": simulated_count,
+        "mode": "SMTP Live" if use_real_smtp else "Simulated (configure SMTP_USER and SMTP_PASS for real emails)",
     }
 
-    
+
+def _announcement_smtp_connection():
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    if not (smtp_user and smtp_pass):
+        return None, smtp_user
+    server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+    server.starttls()
+    server.login(smtp_user, smtp_pass)
+    return server, smtp_user
+
+
+def _send_announcement_message(server, smtp_user, participant, event, subject, message):
+    safe_name = html.escape(participant.name or "there")
+    safe_event = html.escape(event.name)
+    safe_message = html.escape(message).replace("\r\n", "\n").replace("\n", "<br>")
+    body = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;background:#fff4e0;color:#2b1206;padding:24px">
+    <div style="max-width:600px;margin:auto;background:#ffffff;border:1px solid #e6be86;border-radius:12px;padding:24px">
+    <h2 style="color:#c03410">{safe_event}</h2><p>Hi {safe_name},</p><p style="line-height:1.6">{safe_message}</p>
+    <p style="font-size:12px;color:#66452d">Thira Cochin Events</p></div></body></html>"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject.replace("{event_name}", event.name).replace("{name}", participant.name)
+    msg["From"] = f"Thira Cochin Events <{smtp_user}>"
+    msg["To"] = participant.email
+    msg.attach(MIMEText(message, "plain", "utf-8"))
+    msg.attach(MIMEText(body, "html", "utf-8"))
+    server.sendmail(smtp_user, participant.email, msg.as_string())
+
+
+@app.post("/events/{event_id}/announcements")
+def send_announcement(
+    event_id: str,
+    payload: AnnouncementRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a separately tracked announcement campaign for an event."""
+    event = require_event_access(event_id, current_user, db)
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="Only Core and assigned Event Heads can send announcements")
+
+    query = db.query(models.Participant).filter(models.Participant.event_id == event_id)
+    if payload.recipient_filter == "checked_in":
+        query = query.filter(models.Participant.checked_in.is_(True))
+    elif payload.recipient_filter == "not_checked_in":
+        query = query.filter(or_(models.Participant.checked_in.is_(False), models.Participant.checked_in.is_(None)))
+    recipients = query.order_by(models.Participant.name.asc(), models.Participant.id.asc()).all()
+    if not recipients:
+        return {"message": "No participants match this recipient selection", "campaign_id": None, "total": 0, "sent": 0, "failed": 0, "skipped": 0, "mode": "No recipients"}
+
+    campaign = models.AnnouncementCampaign(
+        event_id=event_id, created_by_id=current_user.id,
+        subject=payload.subject.strip(), message=payload.message,
+        recipient_filter=payload.recipient_filter,
+    )
+    db.add(campaign)
+    db.flush()
+    for participant in recipients:
+        db.add(models.AnnouncementRecipient(campaign_id=campaign.id, participant_id=participant.id, status="pending"))
+    db.commit()
+    campaign_id = campaign.id
+
+    try:
+        server, smtp_user = _announcement_smtp_connection()
+    except Exception as exc:
+        db.query(models.AnnouncementRecipient).filter(
+            models.AnnouncementRecipient.campaign_id == campaign_id,
+            models.AnnouncementRecipient.status == "pending",
+        ).update({models.AnnouncementRecipient.status: "failed", models.AnnouncementRecipient.last_error: str(exc)[:1000], models.AnnouncementRecipient.attempted_at: datetime.utcnow()}, synchronize_session=False)
+        db.commit()
+        return {
+            "message": "Announcement campaign saved, but SMTP connection failed. You can retry failed recipients.",
+            "campaign_id": campaign_id,
+            "total": len(recipients),
+            "sent": 0,
+            "failed": len(recipients),
+            "skipped": 0,
+            "simulated": 0,
+            "mode": "SMTP Connection Failed",
+            "error": str(exc),
+        }
+
+    sent = failed = simulated = 0
+    try:
+        for participant in recipients:
+            log = db.query(models.AnnouncementRecipient).filter_by(campaign_id=campaign_id, participant_id=participant.id).first()
+            log.attempted_at = datetime.utcnow()
+            if not server:
+                # Never label a simulated local send as a real delivery.
+                log.status = "simulated"
+                log.last_error = None
+                simulated += 1
+            else:
+                try:
+                    _send_announcement_message(server, smtp_user, participant, event, campaign.subject, campaign.message)
+                    log.status = "sent"
+                    log.sent_at = datetime.utcnow()
+                    log.last_error = None
+                    sent += 1
+                except Exception as exc:
+                    log.status = "failed"
+                    log.last_error = str(exc)[:1000]
+                    failed += 1
+            db.commit()
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+    return {"message": "Announcement processing completed", "campaign_id": campaign_id, "total": len(recipients), "sent": sent, "failed": failed, "skipped": 0, "simulated": simulated, "mode": "SMTP Live" if server else "Simulated (configure SMTP_USER and SMTP_PASS for real emails)"}
+
+
+@app.post("/events/{event_id}/announcements/{campaign_id}/retry")
+def retry_announcement_failures(
+    event_id: str,
+    campaign_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retry only failed recipients from an existing campaign; successful recipients are never resent."""
+    event = require_event_access(event_id, current_user, db)
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="Only Core and assigned Event Heads can retry announcements")
+    campaign = db.query(models.AnnouncementCampaign).filter_by(id=campaign_id, event_id=event_id).first()
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Announcement campaign not found")
+    logs = db.query(models.AnnouncementRecipient).filter_by(campaign_id=campaign_id, status="failed").all()
+    if not logs:
+        return {"message": "There are no failed recipients to retry", "campaign_id": campaign_id, "sent": 0, "failed": 0, "skipped": db.query(models.AnnouncementRecipient).filter_by(campaign_id=campaign_id, status="sent").count(), "mode": "No retries needed"}
+    try:
+        server, smtp_user = _announcement_smtp_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"SMTP connection failed: {str(exc)}")
+    if not server:
+        return {"message": "SMTP is not configured; no retry was sent", "campaign_id": campaign_id, "sent": 0, "failed": len(logs), "skipped": db.query(models.AnnouncementRecipient).filter_by(campaign_id=campaign_id, status="sent").count(), "mode": "Simulated"}
+    sent = failed = 0
+    try:
+        for log in logs:
+            participant = db.query(models.Participant).filter_by(id=log.participant_id, event_id=event_id).first()
+            if not participant:
+                continue
+            log.status = "sending"
+            log.attempted_at = datetime.utcnow()
+            db.commit()
+            try:
+                _send_announcement_message(server, smtp_user, participant, event, campaign.subject, campaign.message)
+                log.status = "sent"
+                log.sent_at = datetime.utcnow()
+                log.last_error = None
+                sent += 1
+            except Exception as exc:
+                log.status = "failed"
+                log.last_error = str(exc)[:1000]
+                failed += 1
+            db.commit()
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return {"message": "Announcement retry completed", "campaign_id": campaign_id, "sent": sent, "failed": failed, "skipped": db.query(models.AnnouncementRecipient).filter_by(campaign_id=campaign_id, status="sent").count(), "mode": "SMTP Live"}
+
 
 class ExpectedParticipantsUpdate(BaseModel):
     expected_participants: int = Field(..., alias="expectedParticipants", ge=0)
@@ -1184,6 +1584,12 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(
         models.User.email == email
     ).first()
+
+    if user is not None and not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account invitation has not been completed. Open the invitation email to set your password.",
+        )
 
     if not user or not verify_password(
         user.hashed_password, payload.password

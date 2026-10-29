@@ -95,3 +95,64 @@ button:not(:disabled):active { transform: scale(.97); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+
+/* ---------- Responsive dashboard and mobile check-in ---------- */
+html, body, #root {
+  min-height: 100%;
+  width: 100%;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+button, input, select, textarea {
+  max-width: 100%;
+}
+
+@media (max-width: 767px) {
+  /* Keep camera output inside the scanner panel on narrow screens. */
+  [id^="reader-"] {
+    width: 100% !important;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  [id^="reader-"] video,
+  [id^="reader-"] canvas {
+    max-width: 100% !important;
+    height: auto !important;
+    object-fit: cover;
+  }
+
+  [id^="reader-"] img {
+    max-width: min(100%, 280px);
+  }
+
+  [id^="reader-"] select {
+    max-width: 100%;
+  }
+
+  /* Avoid oversized injected QR scanner controls on mobile. */
+  [id^="reader-"] button {
+    min-height: 40px;
+    padding: 0.55rem 0.8rem;
+  }
+
+  /* Keep long event names, IDs, and emails from widening the page. */
+  main {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  input, select, textarea {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 380px) {
+  [id^="reader-"] video {
+    max-height: 42vh;
+  }
+}

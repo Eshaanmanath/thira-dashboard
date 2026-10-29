@@ -24,6 +24,10 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     role = Column(Enum(UserRole), default=UserRole.VOLUNTEER, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Existing accounts stay active; invitation-created accounts remain inactive until setup.
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    invitation_token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    invitation_expires_at = Column(DateTime, nullable=True)
 
     checked_in_participants = relationship("Participant", back_populates="checked_in_by_volunteer")
 
@@ -91,6 +95,12 @@ class Participant(Base):
     email = Column(String, nullable=False, index=True)
     phone = Column(String, nullable=True)
     qr_token = Column(String, unique=True, index=True, default=lambda: f"THIRA-{uuid.uuid4().hex[:8].upper()}")
+    # QR-pass email state is independent from announcements.
+    # "sent" records successful SMTP handoff; "failed" can be retried.
+    qr_email_status = Column(String(20), nullable=False, default="not_sent", server_default="not_sent")
+    qr_email_attempted_at = Column(DateTime, nullable=True)
+    qr_email_sent_at = Column(DateTime, nullable=True)
+    qr_email_last_error = Column(String(1000), nullable=True)
     
     checked_in = Column(Boolean, default=False)
     checked_in_at = Column(DateTime, nullable=True)
@@ -98,3 +108,27 @@ class Participant(Base):
 
     event = relationship("Event", back_populates="participants")
     checked_in_by_volunteer = relationship("User", back_populates="checked_in_participants")
+
+class AnnouncementCampaign(Base):
+    __tablename__ = "announcement_campaigns"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_id = Column(String, ForeignKey("events.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_id = Column(String, ForeignKey("users.id"), nullable=True)
+    subject = Column(String(255), nullable=False)
+    message = Column(String, nullable=False)
+    recipient_filter = Column(String(30), nullable=False, default="all")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AnnouncementRecipient(Base):
+    __tablename__ = "announcement_recipients"
+    __table_args__ = (UniqueConstraint("campaign_id", "participant_id", name="uq_announcement_campaign_participant"),)
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    campaign_id = Column(String, ForeignKey("announcement_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    participant_id = Column(String, ForeignKey("participants.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    attempted_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    last_error = Column(String(1000), nullable=True)
