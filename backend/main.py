@@ -127,6 +127,7 @@ class EventCreate(BaseModel):
     event_head_1: Optional[str] = Field(None, alias="eventHead1")
     event_head_2: Optional[str] = Field(None, alias="eventHead2")
     status: Optional[str] = "Registrations Open"
+    expected_participants: int = Field(0, alias="expectedParticipants", ge=0)
 
     class Config:
         populate_by_name = True
@@ -138,6 +139,7 @@ class EventResponse(BaseModel):
     event_head_1: Optional[str] = None
     event_head_2: Optional[str] = None
     status: str
+    expected_participants: int = 0
     created_at: str
 
     class Config:
@@ -229,6 +231,7 @@ def get_events(
                 if hasattr(evt.status, "value")
                 else evt.status
             ),
+            "expected_participants": getattr(evt, "expected_participants", 0) or 0,
             "created_at": (
                 evt.created_at.strftime("%Y-%m-%d")
                 if evt.created_at else ""
@@ -294,6 +297,7 @@ def create_event(
         event_head_1=head1.email if head1 else None,
         event_head_2=head2.email if head2 else None,
         status=event.status,
+        expected_participants=event.expected_participants,
     )
     try:
         db.add(db_event)
@@ -315,6 +319,7 @@ def create_event(
         "event_head_1": db_event.event_head_1 or "Unassigned",
         "event_head_2": db_event.event_head_2 or "Unassigned",
         "status": db_event.status.value if hasattr(db_event.status, "value") else db_event.status,
+        "expected_participants": db_event.expected_participants or 0,
         "created_at": db_event.created_at.strftime("%Y-%m-%d") if db_event.created_at else "",
     }
 
@@ -514,13 +519,15 @@ async def import_participants_csv(
 )
 def get_users(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(
-        require_roles(models.UserRole.CORE)
-    ),
+    current_user: models.User = Depends(get_current_user),
 ):
-    users = db.query(models.User).order_by(
-        models.User.created_at.desc()
-    ).all()
+    if current_user.role == models.UserRole.CORE:
+        query = db.query(models.User)
+    elif current_user.role == models.UserRole.EVENT_HEAD:
+        query = db.query(models.User).filter(models.User.role == models.UserRole.VOLUNTEER)
+    else:
+        raise HTTPException(status_code=403, detail="Only Core and Event Heads can list users")
+    users = query.order_by(models.User.created_at.desc()).all()
 
     return [
         {
@@ -540,9 +547,7 @@ def get_users(
 def create_user(
     user: UserCreate,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(
-        require_roles(models.UserRole.CORE)
-    ),
+    current_user: models.User = Depends(get_current_user),
 ):
     # RBAC Rules for User Creation:
     # 1. Core can create Core or Event Head (and Volunteers).
@@ -550,8 +555,11 @@ def create_user(
     # 3. Volunteers cannot create users.
     
     target_role = user.role.value if hasattr(user.role, 'value') else user.role
+    if current_user.role == models.UserRole.EVENT_HEAD and user.role != models.UserRole.VOLUNTEER:
+        raise HTTPException(status_code=403, detail="Event Heads can create Volunteer accounts only")
+    if current_user.role == models.UserRole.VOLUNTEER:
+        raise HTTPException(status_code=403, detail="Volunteers cannot create users")
 
-    
     # Check if email already exists
     existing_user = db.query(models.User).filter(models.User.email == user.email.lower()).first()
     if existing_user:
@@ -633,6 +641,88 @@ def assign_volunteer(
         "user_id": volunteer.id,
     }
 
+
+
+class EventStatusUpdate(BaseModel):
+    status: str
+
+
+@app.put("/events/{event_id}/status")
+def update_event_status(
+    event_id: str,
+    payload: EventStatusUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update event status. Core and assigned Event Heads only."""
+    event = require_event_access(event_id, current_user, db)
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="Only Core and Event Heads can change event status")
+
+    allowed_statuses = {
+        "Registrations Open": models.EventStatus.REGISTRATIONS_OPEN,
+        "Ongoing": models.EventStatus.ONGOING,
+        "Completed": models.EventStatus.COMPLETED,
+    }
+    new_status = allowed_statuses.get(payload.status)
+    if new_status is None:
+        raise HTTPException(status_code=400, detail="Invalid event status")
+
+    event.status = new_status
+    db.commit()
+    db.refresh(event)
+    return {"event_id": event.id, "status": event.status.value if hasattr(event.status, "value") else event.status}
+
+
+@app.get("/events/{event_id}/volunteers")
+def list_event_volunteers(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List volunteers assigned to this event. Only Core and assigned Event Heads."""
+    event = require_event_access(event_id, current_user, db)
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="Only Core and Event Heads can manage event volunteers")
+
+    rows = (
+        db.query(models.User)
+        .join(models.EventMembership, models.EventMembership.user_id == models.User.id)
+        .filter(models.EventMembership.event_id == event.id, models.User.role == models.UserRole.VOLUNTEER)
+        .order_by(models.User.name.asc())
+        .all()
+    )
+    return [{"id": user.id, "name": user.name, "email": user.email, "role": user.role.value if hasattr(user.role, "value") else user.role} for user in rows]
+
+
+@app.delete("/events/{event_id}/volunteers/{user_id}")
+def remove_event_volunteer(
+    event_id: str,
+    user_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove a volunteer's membership from an event without deleting their user account."""
+    event = require_event_access(event_id, current_user, db)
+    if current_user.role not in (models.UserRole.CORE, models.UserRole.EVENT_HEAD):
+        raise HTTPException(status_code=403, detail="Only Core and Event Heads can remove event volunteers")
+
+    volunteer = db.query(models.User).filter(models.User.id == user_id).first()
+    if volunteer is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if volunteer.role != models.UserRole.VOLUNTEER:
+        raise HTTPException(status_code=400, detail="The selected user is not a Volunteer")
+
+    membership = db.query(models.EventMembership).filter(
+        models.EventMembership.event_id == event.id,
+        models.EventMembership.user_id == volunteer.id,
+    ).first()
+    if membership is None:
+        raise HTTPException(status_code=404, detail="Volunteer is not assigned to this event")
+
+    db.delete(membership)
+    db.commit()
+    return {"message": "Volunteer removed from this event", "event_id": event.id, "user_id": volunteer.id}
 
 @app.post("/events/{event_id}/send-passes")
 async def send_event_passes(
@@ -729,6 +819,28 @@ async def send_event_passes(
 
     
 
+class ExpectedParticipantsUpdate(BaseModel):
+    expected_participants: int = Field(..., alias="expectedParticipants", ge=0)
+
+    class Config:
+        populate_by_name = True
+
+
+@app.put("/events/{event_id}/expected-participants")
+def update_expected_participants(
+    event_id: str,
+    payload: ExpectedParticipantsUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update an event's target count for any user assigned to that event."""
+    event = require_event_access(event_id, current_user, db)
+    event.expected_participants = payload.expected_participants
+    db.commit()
+    db.refresh(event)
+    return {"event_id": event.id, "expected_participants": event.expected_participants}
+
+
 @app.get("/events/{event_id}/participants")
 def list_event_participants(
     event_id: str,
@@ -808,11 +920,16 @@ def get_event_stats(
         models.Participant.checked_in.is_(True),
     ).count()
 
+    event = db.query(models.Event).filter(models.Event.id == event_id).first()
+    expected_count = (event.expected_participants or 0) if event else 0
     return {
         "event_id": event_id,
         "registered_count": registered_count,
+        "expected_count": expected_count,
+        "registration_difference": registered_count - expected_count,
         "checked_in_count": checked_in_count,
         "not_checked_in_count": registered_count - checked_in_count,
+        "attendance_rate": round((checked_in_count / registered_count) * 100, 1) if registered_count else 0,
     }
 
 

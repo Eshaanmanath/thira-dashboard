@@ -1,7 +1,7 @@
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Enum, UniqueConstraint
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Enum, UniqueConstraint, Integer
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -38,6 +38,7 @@ class Event(Base):
     # Event Heads (Foreign keys to User)
     event_head_1 = Column(String, nullable=True) # Name/Email or User ID of Event Head 1
     event_head_2 = Column(String, nullable=True) # Name/Email or User ID of Event Head 2
+    expected_participants = Column(Integer, nullable=False, default=0, server_default="0")
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

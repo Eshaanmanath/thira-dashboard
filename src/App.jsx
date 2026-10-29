@@ -15,7 +15,9 @@ import {
   Search,
   CheckCircle2,
   RefreshCw,
-  UserCheck
+  UserCheck,
+  UserMinus,
+  Save
 } from 'lucide-react';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
@@ -65,6 +67,18 @@ export default function Dashboard() {
   const [manualConfirmParticipant, setManualConfirmParticipant] = useState(null);
   const [manualCheckingIn, setManualCheckingIn] = useState(false);
   const [manualCheckInMessage, setManualCheckInMessage] = useState('');
+  const [expectedDraft, setExpectedDraft] = useState('0');
+  const [savingExpected, setSavingExpected] = useState(false);
+  const [showVolunteerModal, setShowVolunteerModal] = useState(false);
+  const [selectedVolunteerId, setSelectedVolunteerId] = useState('');
+  const [creatingVolunteerInline, setCreatingVolunteerInline] = useState(false);
+  const [volunteerDraft, setVolunteerDraft] = useState({ name: '', email: '', password: '' });
+  const [savingVolunteerAssignment, setSavingVolunteerAssignment] = useState(false);
+  const [assignedVolunteers, setAssignedVolunteers] = useState([]);
+  const [loadingAssignedVolunteers, setLoadingAssignedVolunteers] = useState(false);
+  const [removingVolunteerId, setRemovingVolunteerId] = useState('');
+  const [statusDraft, setStatusDraft] = useState('Registrations Open');
+  const [savingEventStatus, setSavingEventStatus] = useState(false);
 
   useEffect(() => {
     const onUnauthorized = () => {
@@ -94,7 +108,7 @@ export default function Dashboard() {
         const user = await res.json();
         setCurrentUser(user);
         await fetchEvents();
-        if (user.role === 'Core') await fetchUsers();
+        if (user.role === 'Core' || user.role === 'Event Head') await fetchUsers();
       } catch {
         localStorage.removeItem(TOKEN_KEY);
         setCurrentUser(null);
@@ -128,7 +142,7 @@ export default function Dashboard() {
       setLoginPassword('');
       setError(null);
       await fetchEvents();
-      if (me.role === 'Core') await fetchUsers();
+      if (me.role === 'Core' || me.role === 'Event Head') await fetchUsers();
     } catch (err) {
       localStorage.removeItem(TOKEN_KEY);
       setLoginError(err.message || 'Unable to sign in');
@@ -178,6 +192,52 @@ export default function Dashboard() {
     }
   };
 
+  const fetchAssignedVolunteers = async (eventId = selectedEvent?.id) => {
+    if (!eventId || !['Core', 'Event Head'].includes(currentRole)) return;
+    try {
+      setLoadingAssignedVolunteers(true);
+      const res = await apiFetch(`${API_BASE}/events/${eventId}/volunteers`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load assigned volunteers');
+      setAssignedVolunteers(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error('Could not load assigned volunteers:', err);
+    } finally {
+      setLoadingAssignedVolunteers(false);
+    }
+  };
+
+  const saveEventStatus = async () => {
+    if (!selectedEvent || savingEventStatus) return;
+    try {
+      setSavingEventStatus(true);
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: statusDraft }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not update event status');
+      setSelectedEvent((prev) => prev ? { ...prev, status: data.status } : prev);
+      setEvents((prev) => prev.map((evt) => evt.id === selectedEvent.id ? { ...evt, status: data.status } : evt));
+      alert('Event status updated.');
+    } catch (err) { alert(`Status update failed: ${err.message}`); }
+    finally { setSavingEventStatus(false); }
+  };
+
+  const removeAssignedVolunteer = async (volunteer) => {
+    if (!selectedEvent || !volunteer || !window.confirm(`Remove ${volunteer.name} from ${selectedEvent.name}? Their user account will not be deleted.`)) return;
+    try {
+      setRemovingVolunteerId(volunteer.id);
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/volunteers/${volunteer.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not remove volunteer');
+      setAssignedVolunteers((prev) => prev.filter((item) => item.id !== volunteer.id));
+      alert(data.message || 'Volunteer removed from event.');
+    } catch (err) { alert(`Could not remove volunteer: ${err.message}`); }
+    finally { setRemovingVolunteerId(''); }
+  };
+
   const fetchParticipants = async (eventId = selectedEvent?.id, search = participantSearch) => {
     if (!eventId) return;
     try {
@@ -205,6 +265,7 @@ export default function Dashboard() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load event statistics');
       setEventStats(data);
+      setExpectedDraft(String(data.expected_count ?? selectedEvent?.expected_participants ?? 0));
     } catch (err) {
       console.error('Could not load event statistics:', err);
     } finally {
@@ -231,6 +292,13 @@ export default function Dashboard() {
   useEffect(() => {
     if (activeTab !== 'event-detail' || !selectedEvent) return;
     fetchEventStats(selectedEvent.id);
+  }, [activeTab, selectedEvent?.id]);
+
+  useEffect(() => {
+    if (activeTab !== 'event-detail' || !selectedEvent) return;
+    setStatusDraft(selectedEvent.status || 'Registrations Open');
+    setAssignedVolunteers([]);
+    fetchAssignedVolunteers(selectedEvent.id);
   }, [activeTab, selectedEvent?.id]);
 
   const handleManualCheckIn = async () => {
@@ -360,6 +428,7 @@ export default function Dashboard() {
     eventDate: '', 
     eventHead1: '', 
     eventHead2: '', 
+    expectedParticipants: '0',
     status: 'Registrations Open' 
   });
   const [submittingEvent, setSubmittingEvent] = useState(false);
@@ -385,6 +454,7 @@ export default function Dashboard() {
         event_date: newEvent.eventDate,
         event_head_1: newEvent.eventHead1 || "Unassigned",
         event_head_2: newEvent.eventHead2 || "Unassigned",
+        expected_participants: Number(newEvent.expectedParticipants || 0),
         status: newEvent.status || "Registrations Open"
       };
 
@@ -403,13 +473,67 @@ export default function Dashboard() {
       
       const createdEvent = await res.json();
       setEvents([createdEvent, ...events]);
-      setNewEvent({ name: '', eventDate: '', eventHead1: '', eventHead2: '', status: 'Registrations Open' });
+      setNewEvent({ name: '', eventDate: '', eventHead1: '', eventHead2: '', expectedParticipants: '0', status: 'Registrations Open' });
       setShowCreateModal(false);
     } catch (err) {
       alert("Error: " + err.message);
     } finally {
       setSubmittingEvent(false);
     }
+  };
+
+  const saveExpectedParticipants = async () => {
+    if (!selectedEvent || expectedDraft.trim() === '' || !Number.isInteger(Number(expectedDraft)) || Number(expectedDraft) < 0) {
+      alert('Expected participant count must be a whole number of 0 or greater.');
+      return;
+    }
+    try {
+      setSavingExpected(true);
+      const res = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/expected-participants`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_participants: Number(expectedDraft) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not update expected count');
+      setEventStats((prev) => prev ? { ...prev, expected_count: data.expected_participants, registration_difference: (prev.registered_count || 0) - data.expected_participants } : prev);
+      setEvents((prev) => prev.map((evt) => evt.id === selectedEvent.id ? { ...evt, expected_participants: data.expected_participants } : evt));
+      setSelectedEvent((prev) => prev ? { ...prev, expected_participants: data.expected_participants } : prev);
+    } catch (err) { alert(`Expected count update failed: ${err.message}`); }
+    finally { setSavingExpected(false); }
+  };
+
+  const handleAssignVolunteer = async (e) => {
+    e.preventDefault();
+    if (!selectedEvent) return;
+    try {
+      setSavingVolunteerAssignment(true);
+      let volunteerId = selectedVolunteerId;
+      if (creatingVolunteerInline) {
+        if (!volunteerDraft.name.trim() || !volunteerDraft.email.trim() || !volunteerDraft.password) throw new Error('Enter the volunteer name, email, and password.');
+        const createRes = await apiFetch(`${API_BASE}/users`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...volunteerDraft, role: 'Volunteer' }),
+        });
+        const created = await createRes.json();
+        if (!createRes.ok) throw new Error(created.detail || 'Could not create volunteer');
+        volunteerId = created.id;
+        setUsers((prev) => [created, ...prev.filter((u) => u.id !== created.id)]);
+      }
+      if (!volunteerId) throw new Error('Choose a volunteer or create a new one.');
+      const assignRes = await apiFetch(`${API_BASE}/events/${selectedEvent.id}/volunteers`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: volunteerId }),
+      });
+      const assigned = await assignRes.json();
+      if (!assignRes.ok) throw new Error(assigned.detail || 'Could not assign volunteer');
+      setShowVolunteerModal(false);
+      fetchAssignedVolunteers(selectedEvent.id);
+      setCreatingVolunteerInline(false);
+      setSelectedVolunteerId('');
+      setVolunteerDraft({ name: '', email: '', password: '' });
+      alert(assigned.message || 'Volunteer assigned successfully.');
+    } catch (err) { alert(`Volunteer assignment failed: ${err.message}`); }
+    finally { setSavingVolunteerAssignment(false); }
   };
 
   const handleCreateUser = async (e) => {
@@ -659,7 +783,7 @@ export default function Dashboard() {
 
               {currentRole === 'Core' ? (
                 <button
-                  onClick={() => setShowCreateModal(true)}
+                  onClick={() => { fetchUsers(); setShowCreateModal(true); }}
                   className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2.5 rounded-lg text-sm font-semibold transition-all shadow-lg shadow-indigo-600/20"
                 >
                   <Plus className="w-4 h-4" />
@@ -820,16 +944,58 @@ export default function Dashboard() {
                 <h2 className="text-2xl font-bold text-white">{selectedEvent.name}</h2>
                 <p className="text-xs text-slate-400">Scheduled: {selectedEvent.event_date} | ID: {selectedEvent.id}</p>
               </div>
-              <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-950 border border-indigo-800 text-indigo-300">
-                Live Workspace ({currentRole} Mode)
-              </span>
+              <div className="flex flex-wrap items-center justify-end gap-3">
+                {(currentRole === 'Core' || currentRole === 'Event Head') && (
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950 p-2">
+                    <label htmlFor="event-status" className="text-xs text-slate-400">Status</label>
+                    <select id="event-status" value={statusDraft} onChange={(e) => setStatusDraft(e.target.value)} className="bg-slate-900 border border-slate-700 text-white rounded-md px-2 py-1.5 text-xs">
+                      <option>Registrations Open</option><option>Ongoing</option><option>Completed</option>
+                    </select>
+                    <button type="button" onClick={saveEventStatus} disabled={savingEventStatus || statusDraft === selectedEvent.status} className="inline-flex items-center gap-1 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 px-2 py-1.5 text-xs text-white"><Save className="w-3.5 h-3.5" />{savingEventStatus ? 'Saving…' : 'Save'}</button>
+                  </div>
+                )}
+                {(currentRole === 'Core' || currentRole === 'Event Head') && <button type="button" onClick={() => { fetchUsers(); setShowVolunteerModal(true); }} className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 px-3 py-2 text-xs font-semibold text-white"><UserPlus className="w-4 h-4" /> Assign Volunteers</button>}
+                <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-950 border border-indigo-800 text-indigo-300">Live Workspace ({currentRole} Mode)</span>
+              </div>
             </div>
 
+            {(currentRole === 'Core' || currentRole === 'Event Head') && (
+              <section className="bg-slate-950 border border-slate-800 rounded-xl p-5 mb-6">
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <div><h3 className="text-base font-semibold text-white">Assigned Volunteers</h3><p className="text-xs text-slate-400 mt-1">Removing a volunteer only removes their access to this event; their account remains.</p></div>
+                  <span className="text-xs text-slate-400">{assignedVolunteers.length} assigned</span>
+                </div>
+                {loadingAssignedVolunteers ? <p className="text-sm text-slate-400">Loading assigned volunteers…</p> : assignedVolunteers.length === 0 ? <p className="text-sm text-slate-500">No volunteers assigned to this event yet.</p> : (
+                  <div className="divide-y divide-slate-800">
+                    {assignedVolunteers.map((volunteer) => (
+                      <div key={volunteer.id} className="flex items-center justify-between gap-3 py-3">
+                        <div><p className="text-sm font-medium text-white">{volunteer.name}</p><p className="text-xs text-slate-400">{volunteer.email}</p></div>
+                        <button type="button" onClick={() => removeAssignedVolunteer(volunteer)} disabled={removingVolunteerId === volunteer.id} className="inline-flex items-center gap-1.5 rounded-md border border-rose-900/70 text-rose-300 hover:bg-rose-950/60 disabled:opacity-50 px-2.5 py-1.5 text-xs"><UserMinus className="w-3.5 h-3.5" />{removingVolunteerId === volunteer.id ? 'Removing…' : 'Remove'}</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
+
             {/* Attendance metrics */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-4 mb-6">
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
                 <p className="text-xs text-slate-400 mb-2">Registered Participants</p>
                 <p className="text-3xl font-bold text-white">{loadingStats ? '—' : (eventStats?.registered_count ?? '—')}</p>
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Expected Participants</p>
+                <p className="text-3xl font-bold text-indigo-300">{loadingStats ? '—' : (eventStats?.expected_count ?? selectedEvent.expected_participants ?? 0)}</p>
+                <div className="flex gap-2 mt-3">
+                  <input aria-label="Expected participant count" type="number" min="0" step="1" value={expectedDraft} onChange={(e) => setExpectedDraft(e.target.value)} className="min-w-0 w-full bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-white" />
+                  <button type="button" onClick={saveExpectedParticipants} disabled={savingExpected} className="rounded-md bg-indigo-600 hover:bg-indigo-500 px-2 py-1 text-xs text-white disabled:opacity-50">{savingExpected ? 'Saving…' : 'Save'}</button>
+                </div>
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Registration vs Expected</p>
+                <p className={`text-3xl font-bold ${(eventStats?.registration_difference ?? 0) >= 0 ? 'text-emerald-300' : 'text-amber-300'}`}>{loadingStats ? '—' : (eventStats?.registration_difference ?? ((eventStats?.registered_count ?? 0) - (eventStats?.expected_count ?? 0)))}</p>
+                <p className="text-xs text-slate-500 mt-2">Registered minus target</p>
               </div>
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
                 <p className="text-xs text-slate-400 mb-2">Checked In</p>
@@ -838,6 +1004,10 @@ export default function Dashboard() {
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
                 <p className="text-xs text-slate-400 mb-2">Not Yet Checked In</p>
                 <p className="text-3xl font-bold text-amber-300">{loadingStats ? '—' : (eventStats?.not_checked_in_count ?? '—')}</p>
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <p className="text-xs text-slate-400 mb-2">Attendance Rate</p>
+                <p className="text-3xl font-bold text-white">{loadingStats ? '—' : `${eventStats?.attendance_rate ?? 0}%`}</p>
               </div>
             </div>
 
@@ -1059,27 +1229,34 @@ export default function Dashboard() {
                 />
               </div>
 
+              <div>
+                <label className="text-xs text-slate-300 block mb-1 font-medium">Expected Participants</label>
+                <input type="number" min="0" step="1" value={newEvent.expectedParticipants} onChange={(e) => setNewEvent({ ...newEvent, expectedParticipants: e.target.value })} className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm focus:outline-none focus:border-indigo-500" required />
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="text-xs text-slate-300 block mb-1 font-medium">Event Head 1</label>
-                  <input
-                    type="text"
-                    placeholder="Name / Email"
+                  <select
                     value={newEvent.eventHead1}
                     onChange={(e) => setNewEvent({ ...newEvent, eventHead1: e.target.value })}
                     className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm focus:outline-none focus:border-indigo-500"
-                  />
+                  >
+                    <option value="">Unassigned</option>
+                    {users.filter((usr) => usr.role === 'Event Head').map((usr) => <option key={usr.id} value={usr.id}>{usr.name} ({usr.email})</option>)}
+                  </select>
                 </div>
 
                 <div>
                   <label className="text-xs text-slate-300 block mb-1 font-medium">Event Head 2</label>
-                  <input
-                    type="text"
-                    placeholder="Name / Email"
+                  <select
                     value={newEvent.eventHead2}
                     onChange={(e) => setNewEvent({ ...newEvent, eventHead2: e.target.value })}
                     className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm focus:outline-none focus:border-indigo-500"
-                  />
+                  >
+                    <option value="">Unassigned</option>
+                    {users.filter((usr) => usr.role === 'Event Head' && usr.id !== newEvent.eventHead1).map((usr) => <option key={usr.id} value={usr.id}>{usr.name} ({usr.email})</option>)}
+                  </select>
                 </div>
               </div>
 
@@ -1353,6 +1530,34 @@ export default function Dashboard() {
                 Close Scanner
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: ASSIGN VOLUNTEER */}
+      {showVolunteerModal && selectedEvent && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-950 border border-slate-800 w-full max-w-lg rounded-2xl p-6">
+            <div className="flex items-start justify-between mb-5">
+              <div><h3 className="text-lg font-bold text-white">Assign Volunteer</h3><p className="text-xs text-slate-400 mt-1">For {selectedEvent.name}. Choose an existing user or create a Volunteer account.</p></div>
+              <button type="button" onClick={() => { setShowVolunteerModal(false); setCreatingVolunteerInline(false); }} className="text-slate-400 hover:text-white"><X className="w-5 h-5" /></button>
+            </div>
+            <form onSubmit={handleAssignVolunteer} className="space-y-4">
+              <div className="flex gap-2">
+                <button type="button" onClick={() => setCreatingVolunteerInline(false)} className={`flex-1 rounded-lg px-3 py-2 text-xs border ${!creatingVolunteerInline ? 'bg-indigo-600 border-indigo-500 text-white' : 'border-slate-700 text-slate-300'}`}>Select existing</button>
+                <button type="button" onClick={() => setCreatingVolunteerInline(true)} className={`flex-1 rounded-lg px-3 py-2 text-xs border ${creatingVolunteerInline ? 'bg-indigo-600 border-indigo-500 text-white' : 'border-slate-700 text-slate-300'}`}>Create new volunteer</button>
+              </div>
+              {!creatingVolunteerInline ? (
+                <div><label className="text-xs text-slate-300 block mb-1">Volunteer user</label><select value={selectedVolunteerId} onChange={(e) => setSelectedVolunteerId(e.target.value)} required={!creatingVolunteerInline} className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm"><option value="">Select a volunteer…</option>{users.filter((usr) => usr.role === 'Volunteer').map((usr) => <option key={usr.id} value={usr.id}>{usr.name} ({usr.email})</option>)}</select>{users.filter((usr) => usr.role === 'Volunteer').length === 0 && <p className="text-xs text-amber-300 mt-2">No existing volunteer accounts found.</p>}</div>
+              ) : (
+                <>
+                  <div><label className="text-xs text-slate-300 block mb-1">Full name</label><input value={volunteerDraft.name} onChange={(e) => setVolunteerDraft({ ...volunteerDraft, name: e.target.value })} required className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm" /></div>
+                  <div><label className="text-xs text-slate-300 block mb-1">Email</label><input type="email" value={volunteerDraft.email} onChange={(e) => setVolunteerDraft({ ...volunteerDraft, email: e.target.value })} required className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm" /></div>
+                  <div><label className="text-xs text-slate-300 block mb-1">Temporary password</label><input type="password" value={volunteerDraft.password} onChange={(e) => setVolunteerDraft({ ...volunteerDraft, password: e.target.value })} required minLength={8} className="w-full bg-slate-900 border border-slate-700 text-white rounded-lg p-2.5 text-sm" /></div>
+                </>
+              )}
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800"><button type="button" onClick={() => setShowVolunteerModal(false)} className="px-4 py-2 text-xs text-slate-300">Cancel</button><button type="submit" disabled={savingVolunteerAssignment} className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">{savingVolunteerAssignment && <Loader2 className="w-3.5 h-3.5 animate-spin" />}{creatingVolunteerInline ? 'Create & Assign' : 'Assign Volunteer'}</button></div>
+            </form>
           </div>
         </div>
       )}
